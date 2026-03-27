@@ -307,12 +307,15 @@ class PagedPrefixTreeUQGenerator:
         num_active: int,
     ):
         """
-        Exploration-phase step: force-branch on all tokens above the
-        configured percentile, up to a hard per-leaf cap of K and
-        global max_active headroom.
+        Exploration-phase step: entropy-gated branching on high-percentile
+        tokens.
 
-        If only one token qualifies (or no headroom), falls back to
-        greedy extend.
+        Branches when the model is uncertain (entropy exceeds the
+        per-sequence EMA baseline), using a softer threshold than the
+        convergence phase to encourage broader exploration.  When the
+        model is confident (entropy below baseline), greedy-extends
+        instead of wasting branch budget on positions where the top
+        token is near-certain.
         """
         entropy = compute_entropy(logits, self.temperature)
         self.entropy_trace.append((step, leaf.node_id, entropy))
@@ -321,13 +324,16 @@ class PagedPrefixTreeUQGenerator:
         if leaf.entropy_ema is None:
             leaf.entropy_ema = entropy
         else:
-            leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
+            leaf.entropy_ema = (
+                self.entropy_ema_alpha * entropy
+                + (1.0 - self.entropy_ema_alpha) * leaf.entropy_ema
+            )
 
-        # Calculate the dynamic threshold
-        # We scale the relative multiplier by tree utilization to preserve your memory safety mechanism
+        # Dynamic threshold — same capacity-aware scaling as convergence,
+        # but we use the raw EMA as the baseline (no extra multiplier)
+        # so exploration is more willing to branch than convergence.
         util = num_active / max(self.M, 1)
-        dynamic_multiplier = self.relative_entropy_multiplier * (1.0 + 2.0 * util * util)
-        
+        dynamic_multiplier = 1.0 + 2.0 * util * util
         tau = leaf.entropy_ema * dynamic_multiplier
 
         seq_so_far = leaf.get_full_sequence()
@@ -341,7 +347,11 @@ class PagedPrefixTreeUQGenerator:
 
         headroom = self.M - num_active
 
-        if headroom >= 2:
+        # Gate on entropy: only branch when the model is actually
+        # uncertain (entropy above the adaptive baseline).  This
+        # conserves branch budget for positions where branching
+        # discovers genuinely distinct continuations.
+        if headroom >= 2 and entropy > tau:
             self._do_branch_explore(tree, leaf, penalized, step, headroom)
         else:
             self._do_extend(tree, leaf, penalized)
