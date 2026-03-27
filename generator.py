@@ -9,648 +9,423 @@ import torch
 import torch.nn.functional as F
 
 from paged_kv_cache import PagedKVCacheManager
-from generator_utils import (TreeNode, 
-                            PrefixTree, 
-                            compute_entropy, 
-                            apply_repetition_penalty, 
-                            _find_blocked_tokens, 
-                            adaptive_threshold, 
-                            PagedModelWrapper)
+
 
 # ============================================================================
-# 4.  MAIN GENERATOR (paged, batched)
+# 1.  PREFIX TREE DATA STRUCTURES (paged variant)
 # ============================================================================
 
-class PagedPrefixTreeUQGenerator:
+@dataclass
+class TreeNode:
+    node_id: int
+    token_ids: list[int] = field(default_factory=list)
+    seq_id: Optional[int] = None           
+    parent: Optional['TreeNode'] = None
+    children: dict[int, 'TreeNode'] = field(default_factory=dict)
+    cumulative_log_prob: float = 0.0
+    depth: int = 0                          
+    is_active: bool = True
+    is_eos: bool = False
+    semantic_vector: Optional[torch.Tensor] = None  
+    entropy_ema: Optional[float] = None   # Track local entropy baseline          
+    creation_step: int = 0
+
+    def get_full_sequence(self) -> list[int]:
+        """Collect all generated token ids from root to this node."""
+        parts: list[list[int]] = []
+        node = self
+        while node is not None:
+            if node.token_ids:
+                parts.append(node.token_ids)
+            node = node.parent
+        parts.reverse()
+        return [tok for seg in parts for tok in seg]
+
+
+class PrefixTree:
     """
-    Uncertainty-quantification generator using entropy-gated prefix-tree
-    branching, backed by paged KV-cache and batched decoding.
+    Manages a tree of generation branches.  Supports extend, branch,
+    and prune — all backed by paged KV-cache operations.
+    """
 
-    At each decode step:
-      1. Collect all active leaves.
-      2. Run a single batched forward pass for all of them.
-      3. For each leaf, decide branch vs. extend based on entropy.
-      4. Prune low-probability branches.
+    def __init__(self, kv_cache_mgr: PagedKVCacheManager):
+        self.root = TreeNode(node_id=0)
+        self._next_id = 1
+        self.kv_cache_mgr = kv_cache_mgr
 
-    Branching is O(1) in memory (page-table fork + refcount bumps).
-    Pruning releases pages via refcount decrement.
+    def new_id(self) -> int:
+        nid = self._next_id
+        self._next_id += 1
+        return nid
+
+    # ---- extend -----------------------------------------------------------
+    def extend_leaf(
+        self,
+        leaf: TreeNode,
+        token_id: int,
+        log_prob: float,
+    ) -> TreeNode:
+        """Append one token to *leaf* in-place."""
+        leaf.token_ids.append(token_id)
+        leaf.cumulative_log_prob += log_prob
+        leaf.depth += 1
+        return leaf
+
+    # ---- branch -----------------------------------------------------------
+    def branch_leaf(
+        self,
+        leaf: TreeNode,
+        token_ids: list[int],
+        log_probs: list[float],
+    ) -> list[TreeNode]:
+        """
+        Create len(token_ids) children from *leaf*.
+
+        Each child gets a forked paged-cache sequence (O(1) page-table
+        copy).  The parent leaf is deactivated and its paged sequence
+        is freed (refcounts handle sharing).
+        """
+        children: list[TreeNode] = []
+        for tid, lp in zip(token_ids, log_probs):
+            child_seq_id = self.kv_cache_mgr.fork_sequence(leaf.seq_id)
+            child = TreeNode(
+                node_id=self.new_id(),
+                token_ids=[tid],
+                seq_id=child_seq_id,
+                parent=leaf,
+                cumulative_log_prob=leaf.cumulative_log_prob + lp,
+                depth=leaf.depth + 1,
+                is_active=True,
+                entropy_ema=leaf.entropy_ema
+            )
+            leaf.children[child.node_id] = child
+            children.append(child)
+
+        # Parent is no longer a leaf; free its paged sequence
+        leaf.is_active = False
+        if leaf.seq_id is not None:
+            self.kv_cache_mgr.free_sequence(leaf.seq_id)
+            leaf.seq_id = None
+
+        return children
+
+    # ---- prune ------------------------------------------------------------
+    def prune_branch(self, node: TreeNode):
+        """Remove *node*, free its paged cache, cascade up if needed."""
+        if node.seq_id is not None:
+            self.kv_cache_mgr.free_sequence(node.seq_id)
+            node.seq_id = None
+        node.is_active = False
+
+        if node.parent is not None:
+            parent = node.parent
+            parent.children = {
+                k: v for k, v in parent.children.items()
+                if v.node_id != node.node_id
+            }
+            if (not parent.children and not parent.is_active
+                    and parent.parent is not None):
+                self.prune_branch(parent)
+
+    # ---- queries ----------------------------------------------------------
+    def get_active_leaves(self) -> list[TreeNode]:
+        leaves: list[TreeNode] = []
+        self._walk(self.root, leaves, want_active=True)
+        return leaves
+
+    def get_complete_sequences(self) -> list[TreeNode]:
+        complete: list[TreeNode] = []
+        self._walk(self.root, complete, want_active=False)
+        return complete
+
+    def _walk(self, node: TreeNode, out: list, *, want_active: bool):
+        if want_active:
+            if node.is_active and not node.children and not node.is_eos:
+                out.append(node)
+        else:
+            if node.is_eos:
+                out.append(node)
+        for child in node.children.values():
+            self._walk(child, out, want_active=want_active)
+
+
+# ============================================================================
+# 2.  Entropy & Penalty Utils  
+# ============================================================================
+
+def compute_entropy(logits: torch.Tensor, temperature: float = 1.0) -> float:
+    """Shannon entropy of the softmax distribution (in nats)."""
+    probs = F.softmax(logits / temperature, dim=-1)
+    log_probs = F.log_softmax(logits / temperature, dim=-1)
+    plogp = probs * log_probs
+    plogp = torch.nan_to_num(plogp, nan=0.0)
+    return -plogp.sum().item()
+
+
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    token_ids: list[int],
+    penalty: float = 1.2,
+    frequency_penalty: float = 0.3,
+    max_ngram_block: int = 3,
+) -> torch.Tensor:
+    """Apply repetition suppression to raw logits."""
+    if not token_ids:
+        return logits
+
+    logits = logits.clone()
+
+    if penalty != 1.0 or frequency_penalty > 0:
+        counts: dict[int, int] = {}
+        for tid in token_ids:
+            counts[tid] = counts.get(tid, 0) + 1
+
+        token_indices = list(counts.keys())
+        token_counts = torch.tensor(
+            [counts[t] for t in token_indices],
+            device=logits.device, dtype=logits.dtype,
+        )
+        gathered = logits[token_indices]
+
+        if penalty != 1.0:
+            gathered = torch.where(
+                gathered > 0,
+                gathered / penalty,
+                gathered * penalty,
+            )
+        if frequency_penalty > 0:
+            gathered = gathered - frequency_penalty * token_counts
+
+        logits[token_indices] = gathered
+
+    if max_ngram_block >= 2 and len(token_ids) >= max_ngram_block:
+        blocked = _find_blocked_tokens(token_ids, max_ngram_block)
+        if blocked:
+            logits[list(blocked)] = float('-inf')
+
+    return logits
+
+
+def _find_blocked_tokens(token_ids: list[int], max_n: int) -> set[int]:
+    blocked: set[int] = set()
+    seq_len = len(token_ids)
+    for n in range(2, max_n + 1):
+        if seq_len < n:
+            continue
+        suffix = tuple(token_ids[-(n - 1):])
+        for i in range(seq_len - n + 1):
+            if tuple(token_ids[i:i + n - 1]) == suffix:
+                if i + n - 1 < seq_len:
+                    blocked.add(token_ids[i + n - 1])
+    return blocked
+
+
+def adaptive_threshold(
+    base_val: float,
+    max_active: int,
+    current_active: int,
+) -> float:
+    util = current_active / max(max_active, 1)
+    return base_val * (1.0 + 2.0 * util * util)
+
+# ============================================================================
+# 3.  PAGED MODEL WRAPPER  (adapter-based)
+# ============================================================================
+
+class PagedModelWrapper:
+    """
+    Thin wrapper over TransformerForCausalLM that provides:
+
+        prefill(input_ids, seq_id)  → logits
+        decode_batch(token_ids_per_seq, seq_ids) → list[logits]
+
+    All model-specific logic (norm names, Q/K/V projection, RoPE style,
+    residual patterns) is delegated to a ``ModelAdapter`` instance.
+    The wrapper itself is fully model-agnostic.
     """
 
     def __init__(
         self,
         model,
-        tokenizer,
-        *,
-        max_active_branches: int = 30,
-        branching_factor: int = 5,
-        relative_entropy_multiplier: float = 1.5,
-        entropy_ema_alpha: float = 0.1,
-        pruning_log_prob_gap: float = 10.0,
-        max_new_tokens: int = 256,
-        temperature: float = 1.0,
-        repetition_penalty: float = 1.2,
-        frequency_penalty: float = 0.3,
-        max_ngram_block: int = 3,
-        # Paged cache config
-        block_size: int = 16,
-        max_blocks: int | None = None,
-        # Semantic diversity pruning
-        semantic_similarity_threshold: float = 0.95,
-        # Exploration window
-        exploration_window: int = 10,
-        exploration_percentile: float = 0.99,
+        kv_cache_mgr: PagedKVCacheManager,
+        adapter,  # ModelAdapter instance
+        eos_token_id: int | list[int] = 2,
+        window_size: int | None = None,
     ):
-        eos = tokenizer.eos_token_id
-        if eos is None:
-            eos = 2
-        self.tokenizer = tokenizer
+        self.model = model
+        self.kv_cache_mgr = kv_cache_mgr
+        self.adapter = adapter
+        self.eos_token_id = eos_token_id
+        self.window_size = window_size
 
-        self.M = max_active_branches
-        self.K = branching_factor
-        self.relative_entropy_multiplier = relative_entropy_multiplier 
-        self.entropy_ema_alpha = entropy_ema_alpha                     
-        self.prune_gap = pruning_log_prob_gap
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.rep_penalty = repetition_penalty
-        self.freq_penalty = frequency_penalty
-        self.max_ngram_block = max_ngram_block
-        self.semantic_similarity_threshold = semantic_similarity_threshold
-        self.exploration_window = exploration_window
-        self.exploration_percentile = exploration_percentile
-
-        # Infer model geometry
-        config = model.config
-        num_key_value_heads = config.num_key_value_heads or config.num_attention_heads
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
-
-        # Auto-size block pool if not specified.
-        # Worst case: max_active branches × max_new_tokens tokens each,
-        # plus headroom for CoW copies during branching.
-        if max_blocks is None:
-            tokens_budget = max_active_branches * (max_new_tokens + 512)
-            max_blocks = (tokens_budget // block_size + 1) * 2
-            max_blocks = max(max_blocks, 256)
-
-        # Create the paged KV-cache manager
-        self.kv_cache_mgr = PagedKVCacheManager(
-            num_layers=config.num_hidden_layers,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            max_blocks=max_blocks,
-            block_size=block_size,
-            device=device,
-            dtype=dtype,
-        )
-
-        # Create paged model wrapper
-        self.wrapper = PagedModelWrapper(
-            model, self.kv_cache_mgr, eos_token_id=eos,
-        )
-
-        # Diagnostics
-        self.branch_points: list[tuple[int, float, int]] = []
-        self.pruning_events: list[tuple[int, int]] = []
-        self.entropy_trace: list[tuple[int, int, float]] = []
-        self.diversity_pruning_events: list[tuple[int, int]] = []  # (step, count)
-        self.exploration_branches_created: int = 0
-
-        # Performance / throughput metrics (populated during generate())
-        self.active_branch_trace: list[int] = []   # active branches at each decode step
-        self._total_tokens_decoded: int = 0        # decode-phase tokens (excluding prefill)
-        self._prefill_tokens: int = 0              # prompt token count
-        self._prefill_time_s: float = 0.0          # wall time for prefill
-        self._decode_time_s: float = 0.0           # wall time for decode loop only
-        self._peak_vram_bytes: int = 0             # peak CUDA memory allocated (bytes)
+        # Convenience aliases (read from the adapter)
+        self.device = adapter.device
+        self.dtype = adapter.dtype
+        self.config = adapter.config
+        self.embeddings = adapter.embeddings
+        self.layers = adapter.layers
+        self.final_norm = adapter.final_norm
+        self.lm_head = adapter.lm_head
 
     # ------------------------------------------------------------------
-    #  Public API
+    #  Prefill — single sequence
     # ------------------------------------------------------------------
 
-    def generate(self, prompt: str) -> list[dict]:
+    @torch.no_grad()
+    def prefill(
+        self,
+        input_ids: torch.LongTensor,
+        seq_id: int,
+    ) -> torch.Tensor:
         """
-        Run the full prefix-tree generation with batched decoding.
+        Run the full prompt through the model, writing KV into the
+        paged cache for ``seq_id``.
 
-        Returns a list of dicts sorted by cumulative log-prob (desc):
-            {'token_ids': [...], 'text': str, 'log_prob': float}
+        Returns:
+            logits: (vocab_size,) — logits for the *last* position.
         """
-        # Reset per-run metrics so the object is reusable across prompts.
-        self.active_branch_trace = []
-        self._total_tokens_decoded = 0
-        self._prefill_tokens = 0
-        self._prefill_time_s = 0.0
-        self._decode_time_s = 0.0
-        self._peak_vram_bytes = 0
+        hidden = self.embeddings(input_ids)  # (1, seq_len, D)
+        adapter = self.adapter
 
-        _on_cuda = (self.wrapper.device.type == "cuda")
-        if _on_cuda:
-            torch.cuda.reset_peak_memory_stats(self.wrapper.device)
+        for layer_idx, block in enumerate(self.layers):
+            residual = hidden
+            attn_input = adapter.apply_pre_attn_norm(block, hidden)
 
-        # Encode prompt
-        enc = self.tokenizer(prompt, return_tensors='pt')
-        input_ids = enc['input_ids'].to(self.wrapper.device)
-        self._prefill_tokens = input_ids.shape[-1]
-
-        # ---- Prefill ----
-        _t0_prefill = time.perf_counter()
-        seq_id = self.kv_cache_mgr.allocate_sequence()
-        logits = self.wrapper.prefill(input_ids, seq_id)
-        if _on_cuda:
-            torch.cuda.synchronize(self.wrapper.device)
-        self._prefill_time_s = time.perf_counter() - _t0_prefill
-
-        # Build tree
-        tree = PrefixTree(self.kv_cache_mgr)
-        first_leaf = TreeNode(
-            node_id=tree.new_id(),
-            token_ids=[],
-            seq_id=seq_id,
-            parent=tree.root,
-            cumulative_log_prob=0.0,
-            depth=0,
-            is_active=True,
-        )
-        tree.root.children[0] = first_leaf
-
-        # Handle first decode step from prefill logits
-        # (No hidden state from prefill — semantic vector stays None
-        #  until the first real decode step produces one.)
-        # Step 0 is always in exploration phase.
-        self.active_branch_trace.append(1)  # step 0: one active branch
-        self._step_leaf_explore(tree, first_leaf, logits, step=0, num_active=1)
-
-        # ---- Main decode loop ----
-        _t0_decode = time.perf_counter()
-        for step in range(1, self.max_new_tokens):
-            active = tree.get_active_leaves()
-            if not active:
-                break
-
-            num_active = len(active)
-            self.active_branch_trace.append(num_active)
-            in_exploration = step < self.exploration_window
-
-            # -- Batched forward pass for all active leaves --
-            token_ids_batch = [leaf.token_ids[-1] for leaf in active]
-            seq_ids_batch = [leaf.seq_id for leaf in active]
-
-            logits_list, hidden_states = self.wrapper.decode_batch(
-                token_ids_batch, seq_ids_batch,
+            attn = adapter.get_self_attn(block)
+            attn_out, k_new, v_new = adapter.forward_paged_prefill(
+                attn, attn_input, layer_idx, self.window_size,
             )
-            # Each forward pass decodes one token per active sequence.
-            self._total_tokens_decoded += num_active
 
-            # -- Update semantic vectors via EMA (always, even during
-            #    exploration — we want the vectors warm when pruning
-            #    activates) --
-            self._update_semantic_vectors(active, hidden_states)
+            self.kv_cache_mgr.append_tokens(seq_id, layer_idx, k_new, v_new)
 
-            # -- Per-leaf branch/extend decisions --
-            if in_exploration:
-                for leaf, leaf_logits in zip(list(active), logits_list):
-                    if not leaf.is_active:
-                        continue
-                    self._step_leaf_explore(
-                        tree, leaf, leaf_logits, step, num_active,
-                    )
-            else:
-                for leaf, leaf_logits in zip(list(active), logits_list):
-                    if not leaf.is_active:
-                        continue
-                    self._step_leaf(tree, leaf, leaf_logits, step, num_active)
+            hidden = adapter.apply_post_attn_residual(block, residual, attn_out)
+            residual = hidden
 
-            # -- Semantic diversity prune (convergence phase only) --
-            if not in_exploration:
-                self._prune_similar(tree, step)
+            hidden = adapter.apply_pre_mlp_norm(block, hidden)
+            hidden = adapter.get_mlp(block)(hidden)
+            hidden = adapter.apply_post_mlp_residual(block, residual, hidden)
 
-            # -- Early stop --
-            if not tree.get_active_leaves():
-                break
-
-        if _on_cuda:
-            torch.cuda.synchronize(self.wrapper.device)
-        self._decode_time_s = time.perf_counter() - _t0_decode
-
-        # Snapshot peak CUDA memory (covers both prefill and decode).
-        if _on_cuda:
-            self._peak_vram_bytes = torch.cuda.max_memory_allocated(self.wrapper.device)
-
-        # ---- Collect results ----
-        # ---- Collect results ----
-        results = []
-        
-        # Combine both complete and active leaves for processing
-        all_nodes = tree.get_complete_sequences() + tree.get_active_leaves()
-        
-        for node in all_nodes:
-            tids = node.get_full_sequence()
-            length = max(len(tids), 1) # Prevent division by zero
-            
-            # Calculate length-normalized probability
-            norm_prob = math.exp(node.cumulative_log_prob / length)
-            
-            results.append({
-                'token_ids': tids,
-                'text': self.tokenizer.decode(tids, skip_special_tokens=True),
-                'log_prob': node.cumulative_log_prob,
-                'norm_prob': norm_prob, # Add the new metric
-            })
-
-        # Free any remaining paged sequences
-        self._free_all_sequences(tree)
-
-        # Sort using the newly calculated normalized probability
-        results.sort(key=lambda r: r['norm_prob'], reverse=True)
-        return results
+        hidden = self.final_norm(hidden)
+        logits = self.lm_head(hidden[0, -1, :])  # (vocab_size,)
+        return logits
 
     # ------------------------------------------------------------------
-    #  Internals
-    # ------------------------------------------------------------------
-    def _handle_eos(self, tree: PrefixTree, node: TreeNode) -> None:
-        """Checks if the node's last token is EOS, and if so, deactivates and frees it."""
-        if self.wrapper.is_eos(node.token_ids[-1]):
-            node.is_eos = True
-            node.is_active = False
-            if node.seq_id is not None:
-                tree.kv_cache_mgr.free_sequence(node.seq_id)
-                node.seq_id = None
-
-    def _free_all_sequences(self, tree: PrefixTree):
-        """Release all paged sequences still held by tree nodes."""
-        self._free_walk(tree.root)
-
-    def _free_walk(self, node: TreeNode):
-        """Recursively free paged sequences."""
-        if node.seq_id is not None:
-            self.kv_cache_mgr.free_sequence(node.seq_id)
-            node.seq_id = None
-        for child in node.children.values():
-            self._free_walk(child)
-
-    # ------------------------------------------------------------------
-    #  Exploration phase: fan-out on high-percentile tokens
+    #  Batched decode — all active leaves in one forward pass
     # ------------------------------------------------------------------
 
-    def _step_leaf_explore(
+    @torch.no_grad()
+    def decode_batch(
         self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-        step: int,
-        num_active: int,
-    ):
+        token_ids_per_seq: list[int],
+        seq_ids: list[int],
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
         """
-        Exploration-phase step: force-branch on all tokens above the
-        configured percentile, up to a hard per-leaf cap of K and
-        global max_active headroom.
+        Decode one token per sequence for a batch of active leaves.
 
-        If only one token qualifies (or no headroom), falls back to
-        greedy extend.
+        Returns:
+            logits_list: List of N logits tensors, each (vocab_size,).
+            hidden_states: (N, D) final hidden states before lm_head.
         """
-        entropy = compute_entropy(logits, self.temperature)
-        self.entropy_trace.append((step, leaf.node_id, entropy))
+        N = len(seq_ids)
+        assert N == len(token_ids_per_seq)
+        adapter = self.adapter
 
-        # Update the running EMA for this specific sequence
-        if leaf.entropy_ema is None:
-            leaf.entropy_ema = entropy
-        else:
-            leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
+        if N == 0:
+            D = self.config.hidden_size
+            empty_hidden = torch.empty(
+                0, D, device=self.device, dtype=self.dtype,
+            )
+            return [], empty_hidden
 
-        # Calculate the dynamic threshold
-        # We scale the relative multiplier by tree utilization to preserve your memory safety mechanism
-        util = num_active / max(self.M, 1)
-        dynamic_multiplier = self.relative_entropy_multiplier * (1.0 + 2.0 * util * util)
-        
-        tau = leaf.entropy_ema * dynamic_multiplier
+        # -- Embedding --
+        ids = torch.tensor(
+            token_ids_per_seq, device=self.device, dtype=torch.long,
+        ).unsqueeze(0)  # (1, N)
+        hidden = self.embeddings(ids)  # (1, N, D)
 
-        seq_so_far = leaf.get_full_sequence()
+        seqlen_offsets = [
+            self.kv_cache_mgr.get_kv_length(sid) for sid in seq_ids
+        ]
 
-        penalized = apply_repetition_penalty(
-            logits, seq_so_far,
-            penalty=self.rep_penalty,
-            frequency_penalty=self.freq_penalty,
-            max_ngram_block=self.max_ngram_block,
+        # -- Precompute the shared slot-index tensor for appends --
+        append_slt_indices = (
+            self.kv_cache_mgr.prepare_append_slot_indices(seq_ids)
+        )
+        append_slt_t = torch.tensor(
+            append_slt_indices, device=self.device, dtype=torch.long,
         )
 
-        headroom = self.M - num_active
+        cached_gather_meta = None
 
-        if headroom >= 2:
-            self._do_branch_explore(tree, leaf, penalized, step, headroom)
-        else:
-            self._do_extend(tree, leaf, penalized)
+        for layer_idx, block in enumerate(self.layers):
+            residual = hidden
 
-    def _do_branch_explore(
-        self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-        step: int,
-        headroom: int,
-    ):
-        """
-        Exploration branch: select all tokens whose probability is
-        above the p-th percentile of the distribution, capped at
-        min(K, headroom) branches.
-        """
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = torch.exp(log_probs)
+            attn_input = adapter.apply_pre_attn_norm(block, hidden)
+            attn = adapter.get_self_attn(block)
 
-        # Percentile threshold — computed on GPU via quantile
-        threshold = torch.quantile(probs.float(), self.exploration_percentile)
+            # Step 1: Project K/V + RoPE for the new decode tokens
+            k_new, v_new = adapter.project_kv_for_cache(
+                attn, attn_input, seqlen_offsets,
+            )
 
-        # Mask: tokens above the percentile
-        above_mask = probs >= threshold
-        candidate_indices = above_mask.nonzero(as_tuple=False).squeeze(-1)
+            # Step 2: Append new K/V into paged cache
+            self.kv_cache_mgr.append_tokens_batched_fast(
+                seq_ids=seq_ids,
+                layer_idx=layer_idx,
+                k=k_new,
+                v=v_new,
+                slot_idx_t=append_slt_t,
+            )
 
-        # Cap at min(K, headroom)
-        max_branches = min(self.K, headroom)
+            # Step 3: Build gather metadata once (after layer 0)
+            if layer_idx == 0:
+                cached_gather_meta = (
+                    self.kv_cache_mgr.prepare_gather_metadata(seq_ids)
+                )
 
-        if candidate_indices.numel() <= 1:
-            # Only one token above percentile — just extend
-            best_id = torch.argmax(log_probs).item()
-            best_lp = log_probs[best_id].item()
-            tree.extend_leaf(leaf, best_id, best_lp)
-            
-            # FIX: Replaced manual block with _handle_eos
-            self._handle_eos(tree, leaf) 
-            return
+            # Step 4: Q-only attention reading from paged cache
+            attn_out = adapter.forward_paged_decode(
+                attn, attn_input,
+                kv_cache_mgr=self.kv_cache_mgr,
+                seq_ids=seq_ids,
+                seqlen_offsets=seqlen_offsets,
+                layer_idx=layer_idx,
+                window_size=self.window_size,
+                cached_gather_indices=cached_gather_meta,
+            )
 
-        # If more candidates than our cap, take the top-K by log-prob
-        if candidate_indices.numel() > max_branches:
-            candidate_lps = log_probs[candidate_indices]
-            _, top_idx = torch.topk(candidate_lps, max_branches)
-            candidate_indices = candidate_indices[top_idx]
+            # -- Residual + MLP --
+            hidden = adapter.apply_post_attn_residual(block, residual, attn_out)
+            residual = hidden
 
-        # Extract token ids and log-probs (small tensor → CPU)
-        token_ids = candidate_indices.tolist()
-        token_lps = log_probs[candidate_indices].tolist()
+            hidden = adapter.apply_pre_mlp_norm(block, hidden)
+            hidden = adapter.get_mlp(block)(hidden)
+            hidden = adapter.apply_post_mlp_residual(block, residual, hidden)
 
-        children = tree.branch_leaf(leaf, token_ids, token_lps)
-        self.branch_points.append(
-            (step, compute_entropy(logits), len(children))
-        )
+        hidden = self.final_norm(hidden)
+        hidden_flat = hidden.squeeze(0)  # (N, D)
+        all_logits = self.lm_head(hidden_flat)  # (N, vocab_size)
 
-        for child in children: 
-            child.creation_step = step
-            self._handle_eos(tree, child)
+        return [all_logits[i] for i in range(N)], hidden_flat
 
-
-    def _do_branch(
-        self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-        step: int,
-    ):
-        """Branch *leaf* into top-K children via paged fork."""
-        log_probs = F.log_softmax(logits, dim=-1)
-        topk_vals, topk_ids = torch.topk(log_probs, self.K)
-
-        token_ids = topk_ids.tolist()
-        token_lps = topk_vals.tolist()
-
-        # branch_leaf internally calls kv_cache_mgr.fork_sequence()
-        # for each child — O(1) per fork, no tensor copies.
-        children = tree.branch_leaf(leaf, token_ids, token_lps)
-        self.branch_points.append(
-            (step, compute_entropy(logits), len(children))
-        )
-
-        # FIX: Removed manual semantic_vector cloning here to match _do_branch_explore
-        # (Assuming PrefixTree.branch_leaf handles it now)
-        for child in children: 
-            self._handle_eos(tree, child)
-
-
-    def _do_extend(
-        self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-    ):
-        """Greedy-extend *leaf* by one token."""
-        log_probs = F.log_softmax(logits, dim=-1)
-        best_id = torch.argmax(log_probs).item()
-        best_lp = log_probs[best_id].item()
-
-        tree.extend_leaf(leaf, best_id, best_lp)
-
-        self._handle_eos(tree, leaf)
     # ------------------------------------------------------------------
-    #  Convergence phase: entropy-gated branching (original logic)
+    #  KV projection helper (used by generator for step-0 cache writes)
     # ------------------------------------------------------------------
 
-    def _step_leaf(
+    def _project_kv(
         self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-        step: int,
-        num_active: int,
-    ):
-        """Decide whether to branch or greedy-extend *leaf*."""
-        entropy = compute_entropy(logits, self.temperature)
-        self.entropy_trace.append((step, leaf.node_id, entropy))
-
-        # Update the sequence's specific entropy EMA
-        if leaf.entropy_ema is None:
-            leaf.entropy_ema = entropy
-        else:
-            leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
-
-        # Calculate the dynamic multiplier based on tree capacity
-        dynamic_multiplier = adaptive_threshold(self.relative_entropy_multiplier, self.M, num_active)
-        
-        # The new threshold is the baseline multiplied by the dynamic multiplier
-        tau = leaf.entropy_ema * dynamic_multiplier
-
-        seq_so_far = leaf.get_full_sequence()
-        penalized = apply_repetition_penalty(
-            logits, seq_so_far,
-            penalty=self.rep_penalty,
-            frequency_penalty=self.freq_penalty,
-            max_ngram_block=self.max_ngram_block,
-        )
-
-        headroom = self.M - num_active
-        can_branch = (entropy > tau) and (headroom >= self.K)
-
-        if can_branch:
-            self._do_branch(tree, leaf, penalized, step)
-        else:
-            self._do_extend(tree, leaf, penalized)
-
-    def _update_semantic_vectors(
-        self,
-        leaves: list[TreeNode],
+        attn_module,
         hidden_states: torch.Tensor,
-    ):
-        """
-        Update each leaf's semantic vector using a true running mean 
-        of the new hidden state to prevent recency bias.
-
-        All arithmetic stays on GPU — no .item() or .tolist() calls.
-        """
-        for i, leaf in enumerate(leaves):
-            h = hidden_states[i]  # (D,) — stays on device
-            if leaf.semantic_vector is None:
-                leaf.semantic_vector = h.clone()
-            else:
-                # Calculate dynamic alpha for a true running mean.
-                # Since leaf.depth hasn't been incremented for this step yet, 
-                # the total sequence length represented is leaf.depth + 1.
-                current_length = max(leaf.depth + 1, 2)
-                alpha = 1.0 / current_length
-                
-                # True running mean: v_new = α * h + (1 − α) * v_old
-                leaf.semantic_vector.mul_(1.0 - alpha).add_(h, alpha=alpha)
-    def _prune_similar(self, tree: PrefixTree, step: int):
-        """
-        Pairwise cosine-similarity diversity pruning with threshold annealing.
-        Gives branches a grace period after the exploration phase to diverge
-        semantically before aggressively pruning them.
-        """
-        leaves = tree.get_active_leaves()
-        N = len(leaves)
-        if N <= 1:
-            return
-
-        # Filter to leaves that have a semantic vector
-        sv_leaves: list[TreeNode] = []
-        sv_list: list[torch.Tensor] = []
-        for leaf in leaves:
-            if leaf.semantic_vector is not None and leaf.creation_step < step:
-                sv_leaves.append(leaf)
-                sv_list.append(leaf.semantic_vector)
-
-        M = len(sv_leaves)
-        if M <= 1:
-            return
-
-        # --- Threshold Annealing Logic ---
-        anneal_duration = 20  # Number of steps to glide down to the target threshold
-        steps_past_explore = step - self.exploration_window
-        
-        if steps_past_explore < anneal_duration:
-            # Linear decay from 1.0 down to your target threshold
-            progress = steps_past_explore / anneal_duration
-            current_threshold = 1.0 - (progress * (1.0 - self.semantic_similarity_threshold))
-        else:
-            current_threshold = self.semantic_similarity_threshold
-
-        # (M, D) — stack on GPU, no copies to CPU
-        sv_matrix = torch.stack(sv_list, dim=0)
-
-        # Batched pairwise cosine similarity: O(M^2) on GPU
-        sv_normed = F.normalize(sv_matrix, p=2, dim=1)
-        sim_matrix = torch.mm(sv_normed, sv_normed.t())
-
-        # Mask the diagonal and lower triangle
-        mask = torch.triu(torch.ones(M, M, device=sim_matrix.device, dtype=torch.bool), diagonal=1)
-        sim_matrix = sim_matrix * mask
-
-        # Find pairs above the DYNAMIC threshold
-        above = (sim_matrix > current_threshold).nonzero(as_tuple=False)
-
-        if above.shape[0] == 0:
-            return
-
-        # Move only the small index tensor to CPU for the prune logic
-        pairs = above.tolist()
-
-        # Track which leaves are already marked for pruning this step
-        to_prune: set[int] = set()
-        for i_idx, j_idx in pairs:
-            leaf_i = sv_leaves[i_idx]
-            leaf_j = sv_leaves[j_idx]
-
-            if leaf_i.node_id in to_prune or leaf_j.node_id in to_prune:
-                continue
-
-            # Keep the branch with higher length-normalized cumulative log-prob
-            if leaf_i.cumulative_log_prob / max(leaf_i.depth, 1) >= leaf_j.cumulative_log_prob / max(leaf_j.depth, 1):
-                to_prune.add(leaf_j.node_id)
-            else:
-                to_prune.add(leaf_i.node_id)
-
-        # Execute pruning
-        pruned = 0
-        for leaf in sv_leaves:
-            if leaf.node_id in to_prune and leaf.is_active:
-                tree.prune_branch(leaf)
-                pruned += 1
-
-        if pruned:
-            self.diversity_pruning_events.append((step, pruned))
-
-    # ------------------------------------------------------------------
-    #  Diagnostics
-    # ------------------------------------------------------------------
-
-    def get_diagnostics(self) -> dict:
-        # Count exploration-phase branch points (steps < exploration_window)
-        exploration_bp = [
-            (s, e, k) for s, e, k in self.branch_points
-            if s < self.exploration_window
-        ]
-        convergence_bp = [
-            (s, e, k) for s, e, k in self.branch_points
-            if s >= self.exploration_window
-        ]
-
-        # ---- Throughput ----
-        # decode_tps: tokens emitted per wall-second during the decode loop.
-        # Each forward pass emits one token per active branch, so this is the
-        # total aggregate throughput (sum across all branches).
-        decode_tps = (
-            self._total_tokens_decoded / self._decode_time_s
-            if self._decode_time_s > 0 else 0.0
-        )
-        prefill_tps = (
-            self._prefill_tokens / self._prefill_time_s
-            if self._prefill_time_s > 0 else 0.0
+        seq_ids: list[int],
+        seqlen_offsets: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Delegate to adapter.project_kv_for_cache."""
+        return self.adapter.project_kv_for_cache(
+            attn_module, hidden_states, seqlen_offsets,
         )
 
-        # ---- VRAM ----
-        kv_stats = self.kv_cache_mgr.get_stats()
-
-        return {
-            # --- branch / prune diagnostics (unchanged) ---
-            'num_branch_points': len(self.branch_points),
-            'exploration_branch_points': len(exploration_bp),
-            'convergence_branch_points': len(convergence_bp),
-            'total_pruned': sum(n for _, n in self.pruning_events),
-            'total_diversity_pruned': sum(n for _, n in self.diversity_pruning_events),
-            'branch_points': self.branch_points,
-            'pruning_events': self.pruning_events,
-            'diversity_pruning_events': self.diversity_pruning_events,
-            'entropy_trace': self.entropy_trace,
-
-            # --- active-branch evolution (length == number of decode steps taken) ---
-            # active_branch_trace[i] is the number of live branches at step i.
-            # Step 0 is always 1 (single root sequence after prefill).
-            'active_branch_trace': self.active_branch_trace,
-
-            # --- throughput ---
-            'prefill_tokens': self._prefill_tokens,
-            'prefill_time_s': round(self._prefill_time_s, 4),
-            'prefill_throughput_tps': round(prefill_tps, 2),
-            'decode_tokens_total': self._total_tokens_decoded,
-            'decode_time_s': round(self._decode_time_s, 4),
-            'decode_throughput_tps': round(decode_tps, 2),
-
-            # --- VRAM ---
-            # peak_vram_bytes: peak CUDA memory allocated across both prefill
-            #   and decode (weights + activations + KV cache).  0 on CPU.
-            'peak_vram_bytes': self._peak_vram_bytes,
-            'peak_vram_mb': round(self._peak_vram_bytes / 1024 ** 2, 2),
-            # peak_kv_cache_bytes: high-water mark for KV-cache pages only
-            #   (derived from peak block count × bytes-per-block).
-            'peak_kv_cache_bytes': kv_stats['peak_kv_cache_bytes'],
-            'peak_kv_cache_mb': round(kv_stats['peak_kv_cache_bytes'] / 1024 ** 2, 2),
-            'kv_blocks_peak': kv_stats['blocks_peak'],
-            'kv_blocks_total': kv_stats['blocks_total'],
-            'kv_peak_utilization': round(kv_stats['peak_utilization'], 4),
-        }
+    # ------------------------------------------------------------------
+    def is_eos(self, token_id: int) -> bool:
+        if isinstance(self.eos_token_id, (list, tuple)):
+            return token_id in self.eos_token_id
+        return token_id == self.eos_token_id

@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from paged_attention_injector import PagedKVCacheManager
+from paged_kv_cache import PagedKVCacheManager
 
 
 # ============================================================================
@@ -261,7 +261,14 @@ class PagedModelWrapper:
         self.dtype = next(model.parameters()).dtype
 
         base = model.model if hasattr(model, 'model') else model
-        self.embeddings = base.embed_tokens
+        _emb_candidates = ['embed_tokens', 'word_embeddings', 'wte', 'embed']
+        try:
+            self.embeddings = next(getattr(base, n) for n in _emb_candidates if hasattr(base, n))
+        except StopIteration:
+            raise AttributeError(
+                f"Could not find an embedding table in {type(base).__name__}. "
+                f"Checked: {_emb_candidates}. Add the correct attribute name to the list."
+            )
         self.layers = base.layers
         self.final_norm = base.norm
         self.lm_head = model.lm_head
@@ -269,8 +276,34 @@ class PagedModelWrapper:
 
         # --- Duck Type Normalization Layers ---
         first_block = self.layers[0]
-        self._norm1_attr = next(name for name in ['input_layernorm', 'ln_1', 'attention_norm'] if hasattr(first_block, name))
-        self._norm2_attr = next(name for name in ['post_attention_layernorm', 'ln_2', 'ffn_norm'] if hasattr(first_block, name))
+        # Candidates ordered by frequency across Llama / Mistral / Qwen / Gemma / Falcon / GPT-2.
+        _norm1_candidates = [
+            'input_layernorm',       # Llama, Mistral, Qwen
+            'pre_attention_layernorm',  # Gemma
+            'ln_1',                  # GPT-2 / Falcon
+            'attention_norm',        # some older variants
+        ]
+        _norm2_candidates = [
+            'post_attention_layernorm',     # Llama, Mistral, Qwen
+            'pre_feedforward_layernorm',    # Gemma (pre-MLP norm)
+            'post_feedforward_layernorm',   # Gemma (post-MLP norm — only needed if you expose it)
+            'ln_2',                         # GPT-2 / Falcon
+            'ffn_norm',                     # some older variants
+        ]
+        try:
+            self._norm1_attr = next(n for n in _norm1_candidates if hasattr(first_block, n))
+        except StopIteration:
+            raise AttributeError(
+                f"Could not find a pre-attention norm in {type(first_block).__name__}. "
+                f"Checked: {_norm1_candidates}. Add the correct attribute name to the list."
+            )
+        try:
+            self._norm2_attr = next(n for n in _norm2_candidates if hasattr(first_block, n))
+        except StopIteration:
+            raise AttributeError(
+                f"Could not find a post-attention norm in {type(first_block).__name__}. "
+                f"Checked: {_norm2_candidates}. Add the correct attribute name to the list."
+            )
 
     # ------------------------------------------------------------------
     #  Prefill — single sequence

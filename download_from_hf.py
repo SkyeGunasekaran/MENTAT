@@ -4,6 +4,9 @@ import os
 from huggingface_hub import snapshot_download
 
 MODELS = {
+    "mistral": [
+        "mistralai/Ministral-3-3B-Instruct-2512",
+    ],
     "llama": [
         "meta-llama/Llama-3.1-8B-Instruct",
         "meta-llama/Llama-3.1-70B-Instruct",
@@ -21,7 +24,7 @@ MODELS = {
     ],
 }
 
-CACHE_DIR = 'hf_models'
+CACHE_DIR = '/workspace/MENTAT/hf_models'
 
 def download(models):
     for name in models:

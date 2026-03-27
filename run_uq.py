@@ -11,9 +11,9 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ---------------------------------------------------------------------------
-# 1. Import the model-agnostic Paged Attention Injector
+# 1. Import the model adapter system
 # ---------------------------------------------------------------------------
-from paged_attention_injector import inject_paged_attention
+from model_adapter import get_adapter
 
 # ---------------------------------------------------------------------------
 # 2. Import the paged UQ generator
@@ -265,9 +265,10 @@ def main():
     print(f"  Layers:      {model.config.num_hidden_layers}")
     print(f"  Hidden:      {model.config.hidden_size}")
 
-    # ---- INJECT PAGED ATTENTION ----
-    print("  Injecting model-agnostic paged attention...")
-    inject_paged_attention(model)
+    # ---- CREATE MODEL ADAPTER ----
+    print("  Creating model adapter...")
+    adapter = get_adapter(model)
+    print(f"  Adapter: {type(adapter).__name__}")
 
     # ---- UQ parameters summary ----
     print_header("UQ Configuration (Paged Batched)")
@@ -299,6 +300,7 @@ def main():
         gen = PagedPrefixTreeUQGenerator(
             model=model,
             tokenizer=tokenizer,
+            adapter=adapter,
             max_active_branches=args.max_active,
             branching_factor=args.branching_factor,
             relative_entropy_multiplier=args.relative_entropy_multiplier,
