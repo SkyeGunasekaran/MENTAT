@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UQ Generation Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root {
+    --bg: #fafaf8; --bg2: #f1efe8; --bg3: #e8e6df;
+    --tx: #2c2c2a; --tx2: #5f5e5a; --tx3: #888780;
+    --bd: rgba(0,0,0,0.1); --bd2: rgba(0,0,0,0.18);
+    --blue: #378ADD; --red: #E24B4A; --green: #639922;
+    --amber: #BA7517; --purple: #534AB7;
+    --radius: 10px; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1a1a; --bg2: #252523; --bg3: #333330;
+      --tx: #e8e6df; --tx2: #b4b2a9; --tx3: #73726c;
+      --bd: rgba(255,255,255,0.08); --bd2: rgba(255,255,255,0.15);
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: var(--font); background: var(--bg); color: var(--tx); line-height: 1.6; }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 24px 20px 60px; }
+
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+  h2 { font-size: 16px; font-weight: 600; margin: 28px 0 12px; color: var(--tx); }
+  h3 { font-size: 14px; font-weight: 600; margin: 20px 0 8px; color: var(--tx2); }
+  code { font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; background: var(--bg2); padding: 2px 6px; border-radius: 4px; }
+
+  .subtitle { font-size: 13px; color: var(--tx3); margin-bottom: 20px; }
+
+  .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .metric { background: var(--bg2); border-radius: var(--radius); padding: 12px 16px; }
+  .metric-label { font-size: 11px; color: var(--tx3); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .metric-val { font-size: 22px; font-weight: 600; color: var(--tx); }
+  .metric-sub { font-size: 11px; color: var(--tx3); }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 20px; flex-wrap: wrap; }
+  .tab { padding: 6px 14px; border-radius: 6px; border: 0.5px solid var(--bd2); background: transparent; color: var(--tx2); cursor: pointer; font-size: 13px; font-family: var(--font); transition: all 0.15s; }
+  .tab:hover { background: var(--bg2); }
+  .tab.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+
+  .chart-wrap { position: relative; width: 100%; margin-bottom: 8px; }
+  .chart-wrap canvas { width: 100% !important; }
+
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; font-size: 12px; color: var(--tx2); }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  .legend-line { width: 16px; height: 0; flex-shrink: 0; }
+
+  .seq-card { background: var(--bg2); border-radius: var(--radius); padding: 14px 18px; margin-bottom: 10px; }
+  .seq-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .seq-rank { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 50%; font-size: 12px; font-weight: 600; flex-shrink: 0; }
+  .seq-rank.top { background: rgba(55,138,221,0.15); color: var(--blue); }
+  .seq-rank.other { background: var(--bg3); color: var(--tx3); }
+  .seq-meta { font-size: 12px; color: var(--tx3); }
+  .seq-lp { font-size: 13px; font-weight: 600; margin-left: auto; color: var(--tx); }
+  .seq-bar { height: 3px; border-radius: 2px; margin-bottom: 10px; transition: width 0.4s; }
+  .seq-text { font-size: 14px; line-height: 1.7; color: var(--tx); }
+  .seq-prompt { color: var(--tx3); }
+
+  .show-more { padding: 6px 14px; border-radius: 6px; border: 0.5px solid var(--bd2); background: transparent; color: var(--tx2); cursor: pointer; font-size: 13px; font-family: var(--font); margin-top: 4px; }
+  .show-more:hover { background: var(--bg2); }
+
+  .drop-zone { border: 1.5px dashed var(--bd2); border-radius: var(--radius); padding: 28px 24px; text-align: center; margin-bottom: 20px; transition: all 0.2s; }
+  .drop-zone.over { border-color: var(--blue); background: rgba(55,138,221,0.06); }
+  .drop-zone p { font-size: 13px; color: var(--tx3); margin-bottom: 10px; }
+  .drop-zone input[type=file] { font-size: 13px; }
+
+  .demo-badge { font-size: 12px; color: var(--tx3); background: var(--bg2); border-radius: 6px; padding: 6px 14px; margin-bottom: 20px; }
+
+  .prompt-label { font-size: 15px; font-weight: 600; padding: 10px 0; border-bottom: 0.5px solid var(--bd); margin-bottom: 16px; }
+
+  .section-divider { border: none; border-top: 0.5px solid var(--bd); margin: 28px 0; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+  <h1>Prefix-tree UQ dashboard</h1>
+  <p class="subtitle">Entropy-gated branching generation analysis</p>
+
+  <div class="drop-zone" id="dropZone">
+    <p>Drop your <code>uq_results.json</code> here, or</p>
+    <input type="file" accept=".json" id="fileInput">
+  </div>
+  <div class="demo-badge" id="demoBadge">Showing demo data — upload your results to see real runs.</div>
+
+  <div class="metrics" id="globalMetrics"></div>
+  <div class="tabs" id="promptTabs"></div>
+  <div id="promptContent"></div>
+</div>
+
+<script>
+// ── Demo data ──────────────────────────────────────────────────────
+const DEMO = {
+  config: { model_path: "demo-model", max_new_tokens: 128, max_active: 20, branching_factor: 5, base_tau: 1.5, prune_gap: 10.0, temperature: 1.0 },
+  prompts: [
+    {
+      prompt: "The meaning of life is",
+      elapsed_seconds: 14.2, num_sequences: 7,
+      sequences: [
+        { text: "a question that has puzzled philosophers for centuries. At its core, it seems to revolve around finding purpose, connection, and fulfillment in our daily experiences.", log_prob: -12.3, num_tokens: 38 },
+        { text: "subjective and deeply personal. Some find it through relationships, others through creative work or spiritual practice.", log_prob: -15.1, num_tokens: 28 },
+        { text: "fundamentally about consciousness experiencing itself. We are the universe looking back at itself in wonder.", log_prob: -18.7, num_tokens: 22 },
+        { text: "to create meaning. There is no inherent purpose — we build it through our choices and commitments to others.", log_prob: -19.2, num_tokens: 26 },
+        { text: "42, according to Douglas Adams. But more seriously, it's about the connections we forge with one another.", log_prob: -22.4, num_tokens: 25 },
+        { text: "found in service to others. When we give, we receive far more than we could ever accumulate for ourselves alone.", log_prob: -24.8, num_tokens: 24 },
+        { text: "an emergent property of complex biological systems striving to maintain homeostasis and reproduce across generations.", log_prob: -28.1, num_tokens: 20 },
+      ],
+      diagnostics: {
+        num_branch_points: 4, total_pruned: 8,
+        branch_points: [
+          { step: 0, entropy: 6.82, num_children: 5 },
+          { step: 3, entropy: 5.14, num_children: 5 },
+          { step: 12, entropy: 4.91, num_children: 5 },
+          { step: 24, entropy: 3.88, num_children: 5 },
+        ],
+        pruning_events: [
+          { step: 5, count: 2 }, { step: 10, count: 3 },
+          { step: 20, count: 1 }, { step: 30, count: 2 },
+        ],
+        entropy_trace: Array.from({ length: 200 }, (_, i) => ({
+          step: Math.floor(i / 5),
+          node_id: (i % 5) + 1,
+          entropy: 2.0 + Math.sin(i * 0.13) * 2.5 + Math.random() * 0.8 + (i < 25 ? 2 : 0),
+        })),
+      },
+    },
+    {
+      prompt: "In a shocking turn of events, scientists discovered that",
+      elapsed_seconds: 18.6, num_sequences: 5,
+      sequences: [
+        { text: "the universe is expanding at an accelerating rate, contradicting decades of theoretical predictions about cosmic deceleration.", log_prob: -14.5, num_tokens: 32 },
+        { text: "certain bacteria can communicate across species boundaries using previously unknown chemical signals embedded in biofilms.", log_prob: -17.2, num_tokens: 20 },
+        { text: "dark matter may interact with itself through a force completely unknown to modern physics, opening new theoretical avenues.", log_prob: -20.8, num_tokens: 24 },
+        { text: "human memory can be selectively edited at the molecular level, raising profound ethical questions about identity and consent.", log_prob: -26.3, num_tokens: 28 },
+        { text: "the mathematical constants governing our universe appear to be slowly drifting over cosmic timescales.", log_prob: -29.1, num_tokens: 22 },
+      ],
+      diagnostics: {
+        num_branch_points: 3, total_pruned: 12,
+        branch_points: [
+          { step: 0, entropy: 7.21, num_children: 5 },
+          { step: 5, entropy: 5.63, num_children: 5 },
+          { step: 18, entropy: 4.45, num_children: 5 },
+        ],
+        pruning_events: [
+          { step: 4, count: 3 }, { step: 8, count: 4 },
+          { step: 15, count: 2 }, { step: 25, count: 3 },
+        ],
+        entropy_trace: Array.from({ length: 150 }, (_, i) => ({
+          step: Math.floor(i / 4),
+          node_id: (i % 4) + 1,
+          entropy: 2.5 + Math.cos(i * 0.11) * 2.0 + Math.random() * 0.6 + (i < 20 ? 1.5 : 0),
+        })),
+      },
+    },
+  ],
+};
+
+// ── State ──────────────────────────────────────────────────────────
+let data = DEMO;
+let activePrompt = 0;
+let showAllSeqs = false;
+const charts = {};
+
+// ── Render helpers ─────────────────────────────────────────────────
+function el(tag, attrs, ...children) {
+  const e = document.createElement(tag);
+  if (attrs) Object.entries(attrs).forEach(([k, v]) => {
+    if (k === 'className') e.className = v;
+    else if (k.startsWith('on')) e.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k === 'style' && typeof v === 'object') Object.assign(e.style, v);
+    else e.setAttribute(k, v);
+  });
+  children.flat().forEach(c => {
+    if (c == null) return;
+    e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  });
+  return e;
+}
+
+function isDark() { return matchMedia('(prefers-color-scheme: dark)').matches; }
+function gridColor() { return isDark() ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)'; }
+function textColor() { return isDark() ? '#b4b2a9' : '#5f5e5a'; }
+
+// ── Global metrics ─────────────────────────────────────────────────
+function renderGlobalMetrics() {
+  const c = data.config;
+  const box = document.getElementById('globalMetrics');
+  box.innerHTML = '';
+  const items = [
+    ['Model', c.model_path.split('/').pop()],
+    ['Max tokens', c.max_new_tokens],
+    ['Max active', c.max_active],
+    ['Branch K', c.branching_factor],
+    ['Base τ', c.base_tau],
+    ['Prune gap', c.prune_gap],
+  ];
+  items.forEach(([label, val]) => {
+    const m = el('div', { className: 'metric' },
+      el('div', { className: 'metric-label' }, label),
+      el('div', { className: 'metric-val' }, String(val)),
+    );
+    box.appendChild(m);
+  });
+}
+
+// ── Prompt tabs ────────────────────────────────────────────────────
+function renderTabs() {
+  const box = document.getElementById('promptTabs');
+  box.innerHTML = '';
+  data.prompts.forEach((p, i) => {
+    const label = p.prompt.length > 40 ? p.prompt.slice(0, 40) + '…' : p.prompt;
+    const btn = el('button', {
+      className: 'tab' + (i === activePrompt ? ' active' : ''),
+      onClick: () => { activePrompt = i; showAllSeqs = false; renderTabs(); renderPrompt(); },
+    }, label);
+    box.appendChild(btn);
+  });
+}
+
+// ── Per-prompt panel ───────────────────────────────────────────────
+function renderPrompt() {
+  const box = document.getElementById('promptContent');
+  box.innerHTML = '';
+  const p = data.prompts[activePrompt];
+  if (!p) return;
+  const d = p.diagnostics;
+
+  // Prompt label
+  box.appendChild(el('div', { className: 'prompt-label' }, '"' + p.prompt + '"'));
+
+  // Metrics row
+  const branchEnts = d.branch_points.map(b => b.entropy);
+  const avgEnt = branchEnts.length ? (branchEnts.reduce((a, b) => a + b, 0) / branchEnts.length).toFixed(2) : '—';
+  const mbox = el('div', { className: 'metrics' });
+  [
+    ['Sequences', p.num_sequences],
+    ['Branches', d.num_branch_points],
+    ['Pruned', d.total_pruned],
+    ['Avg branch H', avgEnt, 'nats'],
+    ['Time', p.elapsed_seconds + 's'],
+  ].forEach(([l, v, sub]) => {
+    const m = el('div', { className: 'metric' },
+      el('div', { className: 'metric-label' }, l),
+      el('div', { className: 'metric-val' }, String(v)),
+    );
+    if (sub) m.appendChild(el('div', { className: 'metric-sub' }, sub));
+    mbox.appendChild(m);
+  });
+  box.appendChild(mbox);
+
+  // ── Entropy chart ──
+  box.appendChild(el('h2', null, 'Entropy over decode steps'));
+  const eLegend = el('div', { className: 'legend' },
+    el('span', { className: 'legend-item' }, el('span', { className: 'legend-dot', style: { background: 'var(--blue)' } }), 'Mean entropy'),
+    el('span', { className: 'legend-item' }, el('span', { className: 'legend-dot', style: { background: 'var(--red)', borderRadius: '50%' } }), 'Branch point'),
+    el('span', { className: 'legend-item' }, el('span', { className: 'legend-line', style: { borderTop: '1.5px dashed var(--red)' } }), 'Threshold (τ=' + data.config.base_tau + ')'),
+  );
+  box.appendChild(eLegend);
+  const eWrap = el('div', { className: 'chart-wrap', style: { height: '280px' } });
+  const eCanvas = el('canvas', { id: 'entropyChart' });
+  eWrap.appendChild(eCanvas);
+  box.appendChild(eWrap);
+
+  // ── Branch/prune chart ──
+  box.appendChild(el('h2', null, 'Branch creation vs pruning'));
+  const bLegend = el('div', { className: 'legend' },
+    el('span', { className: 'legend-item' }, el('span', { className: 'legend-dot', style: { background: 'var(--blue)' } }), 'Created'),
+    el('span', { className: 'legend-item' }, el('span', { className: 'legend-dot', style: { background: 'var(--red)' } }), 'Pruned'),
+  );
+  box.appendChild(bLegend);
+  const bWrap = el('div', { className: 'chart-wrap', style: { height: '200px' } });
+  const bCanvas = el('canvas', { id: 'branchChart' });
+  bWrap.appendChild(bCanvas);
+  box.appendChild(bWrap);
+
+  // ── Log-prob chart ──
+  box.appendChild(el('h2', null, 'Log-probability distribution'));
+  const lpH = Math.max(160, p.sequences.length * 36 + 60);
+  const lpWrap = el('div', { className: 'chart-wrap', style: { height: lpH + 'px' } });
+  const lpCanvas = el('canvas', { id: 'logprobChart' });
+  lpWrap.appendChild(lpCanvas);
+  box.appendChild(lpWrap);
+
+  box.appendChild(el('hr', { className: 'section-divider' }));
+
+  // ── Sequence cards ──
+  box.appendChild(el('h2', null, 'Generated sequences'));
+  const seqs = p.sequences;
+  const maxLP = Math.max(...seqs.map(s => s.log_prob));
+  const minLP = Math.min(...seqs.map(s => s.log_prob));
+  const range = Math.max(Math.abs(maxLP - minLP), 1);
+  const displayed = showAllSeqs ? seqs : seqs.slice(0, 3);
+
+  displayed.forEach((s, i) => {
+    const norm = 1 - (s.log_prob - maxLP) / range;
+    const barW = Math.max(8, (1 - norm) * 100);
+    const card = el('div', { className: 'seq-card' },
+      el('div', { className: 'seq-header' },
+        el('span', { className: 'seq-rank ' + (i === 0 ? 'top' : 'other') }, String(i + 1)),
+        el('span', { className: 'seq-meta' }, s.num_tokens + ' tokens'),
+        el('span', { className: 'seq-lp' }, (s.log_prob != null ? s.log_prob.toFixed(1) : '—')),
+      ),
+      el('div', { className: 'seq-bar', style: { width: barW + '%', background: i === 0 ? 'var(--blue)' : 'var(--tx3)', opacity: '0.4' } }),
+      el('div', { className: 'seq-text' },
+        el('span', { className: 'seq-prompt' }, p.prompt + ' '),
+        s.text,
+      ),
+    );
+    box.appendChild(card);
+  });
+
+  if (seqs.length > 3) {
+    const btn = el('button', { className: 'show-more', onClick: () => { showAllSeqs = !showAllSeqs; renderPrompt(); } },
+      showAllSeqs ? 'Show fewer' : 'Show all ' + seqs.length + ' sequences');
+    box.appendChild(btn);
+  }
+
+  // ── Draw charts (after DOM is ready) ──
+  requestAnimationFrame(() => {
+    drawEntropyChart(d, data.config.base_tau);
+    drawBranchChart(d);
+    drawLogProbChart(p.sequences);
+  });
+}
+
+// ── Chart: Entropy ─────────────────────────────────────────────────
+function drawEntropyChart(diag, tau) {
+  const canvas = document.getElementById('entropyChart');
+  if (!canvas) return;
+  if (charts.entropy) charts.entropy.destroy();
+
+  const byStep = {};
+  for (const pt of diag.entropy_trace) {
+    if (pt.entropy == null || isNaN(pt.entropy)) continue;
+    if (!byStep[pt.step]) byStep[pt.step] = [];
+    byStep[pt.step].push(pt.entropy);
+  }
+  const steps = Object.keys(byStep).map(Number).sort((a, b) => a - b);
+  const grouped = steps.map(s => ({
+    step: s,
+    mean: byStep[s].reduce((a, b) => a + b, 0) / byStep[s].length,
+    max: Math.max(...byStep[s]),
+  }));
+  const branchSteps = new Set(diag.branch_points.map(b => b.step));
+
+  charts.entropy = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: grouped.map(g => g.step),
+      datasets: [
+        {
+          label: 'Mean entropy',
+          data: grouped.map(g => +g.mean.toFixed(2)),
+          borderColor: '#378ADD', backgroundColor: 'rgba(55,138,221,0.08)',
+          fill: true, tension: 0.35, borderWidth: 2,
+          pointRadius: grouped.map(g => branchSteps.has(g.step) ? 6 : 0),
+          pointBackgroundColor: grouped.map(g => branchSteps.has(g.step) ? '#E24B4A' : '#378ADD'),
+          pointBorderWidth: 0,
+        },
+        {
+          label: 'Max entropy',
+          data: grouped.map(g => +g.max.toFixed(2)),
+          borderColor: 'rgba(55,138,221,0.25)', borderWidth: 1, borderDash: [4, 4],
+          pointRadius: 0, fill: false, tension: 0.35,
+        },
+        {
+          label: 'Threshold',
+          data: grouped.map(() => tau),
+          borderColor: '#E24B4A', borderWidth: 1.5, borderDash: [6, 3],
+          pointRadius: 0, fill: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            afterBody(items) {
+              const step = grouped[items[0].dataIndex]?.step;
+              const bp = diag.branch_points.find(b => b.step === step);
+              return bp ? 'Branch here → ' + bp.num_children + ' children' : '';
+            },
+          },
+        },
+      },
+      scales: {
+        x: { title: { display: true, text: 'Decode step', color: textColor(), font: { size: 12 } }, ticks: { color: textColor(), maxTicksLimit: 15 }, grid: { color: gridColor() } },
+        y: { title: { display: true, text: 'Entropy (nats)', color: textColor(), font: { size: 12 } }, ticks: { color: textColor() }, grid: { color: gridColor() } },
+      },
+    },
+  });
+}
+
+// ── Chart: Branch/Prune ────────────────────────────────────────────
+function drawBranchChart(diag) {
+  const canvas = document.getElementById('branchChart');
+  if (!canvas) return;
+  if (charts.branch) charts.branch.destroy();
+
+  const allSteps = new Set([
+    ...diag.branch_points.map(b => b.step),
+    ...diag.pruning_events.map(p => p.step),
+  ]);
+  const labels = Array.from(allSteps).sort((a, b) => a - b);
+  const branchMap = {}; diag.branch_points.forEach(b => branchMap[b.step] = b.num_children);
+  const pruneMap = {}; diag.pruning_events.forEach(p => pruneMap[p.step] = p.count);
+
+  charts.branch = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Created', data: labels.map(s => branchMap[s] || 0), backgroundColor: '#378ADD', borderRadius: 3, barPercentage: 0.6 },
+        { label: 'Pruned', data: labels.map(s => -(pruneMap[s] || 0)), backgroundColor: '#E24B4A', borderRadius: 3, barPercentage: 0.6 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label(ctx) { const v = Math.abs(ctx.raw); return ctx.datasetIndex === 0 ? '+' + v + ' created' : '−' + v + ' pruned'; } } },
+      },
+      scales: {
+        x: { title: { display: true, text: 'Step', color: textColor(), font: { size: 12 } }, ticks: { color: textColor() }, grid: { display: false } },
+        y: { title: { display: true, text: 'Count', color: textColor(), font: { size: 12 } }, ticks: { color: textColor(), callback: v => Math.abs(Math.round(v)) }, grid: { color: gridColor() } },
+      },
+    },
+  });
+}
+
+// ── Chart: Log-prob bars ───────────────────────────────────────────
+function drawLogProbChart(sequences) {
+  const canvas = document.getElementById('logprobChart');
+  if (!canvas) return;
+  if (charts.logprob) charts.logprob.destroy();
+
+  const sorted = [...sequences].sort((a, b) => b.log_prob - a.log_prob);
+
+  charts.logprob = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: sorted.map((_, i) => 'Seq ' + (i + 1)),
+      datasets: [{
+        data: sorted.map(s => +s.log_prob.toFixed(1)),
+        backgroundColor: sorted.map((_, i) => i === 0 ? '#378ADD' : '#888780'),
+        borderRadius: 4, barPercentage: 0.65,
+      }],
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { title: { display: true, text: 'Cumulative log-prob', color: textColor(), font: { size: 12 } }, ticks: { color: textColor() }, grid: { color: gridColor() } },
+        y: { ticks: { color: textColor() }, grid: { display: false } },
+      },
+    },
+  });
+}
+
+// ── File upload ────────────────────────────────────────────────────
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const parsed = JSON.parse(e.target.result);
+      if (!parsed.config || !parsed.prompts) { alert('Invalid format: expected {config, prompts}'); return; }
+      data = parsed;
+      activePrompt = 0;
+      showAllSeqs = false;
+      document.getElementById('demoBadge').style.display = 'none';
+      render();
+    } catch (err) { alert('Failed to parse JSON: ' + err.message); }
+  };
+  reader.readAsText(file);
+}
+
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+dropZone.addEventListener('drop', (e) => { e.preventDefault(); dropZone.classList.remove('over'); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+// ── Initial render ─────────────────────────────────────────────────
+function render() {
+  renderGlobalMetrics();
+  renderTabs();
+  renderPrompt();
+}
+render();
+</script>
+</body>
+</html>
