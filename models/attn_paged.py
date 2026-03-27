@@ -529,9 +529,10 @@ class PagedAttention(nn.Module):
         kv_cache_mgr : PagedKVCacheManager (already contains this step's KV)
         seq_ids : list[int], one per active sequence
         seqlen_offsets : per-sequence RoPE offset (position of new token)
-        cached_gather_indices : optional precomputed indices from
-            ``kv_cache_mgr.prepare_gather_indices()``.  When provided,
-            ``build_packed_kv`` skips index construction entirely.
+        cached_gather_indices : optional precomputed metadata from
+            ``kv_cache_mgr.prepare_gather_metadata()``.  When provided,
+            ``build_packed_kv`` reuses the slot-index tensor and
+            cu_seqlens_k, only rebuilding per-layer block indices.
 
         Returns
         -------
@@ -568,7 +569,7 @@ class PagedAttention(nn.Module):
         packed_k, packed_v, cu_seqlens_k, max_seqlen_k = (
             kv_cache_mgr.build_packed_kv(
                 seq_ids, self.layer_idx,
-                cached_indices=cached_gather_indices,
+                cached_metadata=cached_gather_indices,
             )
         )
 

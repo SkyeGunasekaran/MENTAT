@@ -224,95 +224,96 @@ class PagedKVCacheManager:
 
         seq.num_tokens[layer_idx] += num_new
         
-    def prepare_append_batched(
+    def prepare_append_slot_indices(
         self,
         seq_ids: list[int],
-    ) -> tuple[list[list[int]], list[int]]:
+    ) -> list[int]:
         """
-        Prepare write destinations for appending 1 token per sequence,
-        performing all block allocations and CoW copies for every layer
-        in one pass.
+        Peek at the slot offsets that the *next* append will write to
+        for each sequence, WITHOUT performing any allocations, CoW, or
+        counter updates.
+
+        Because all layers are kept in sync, the slot offset
+        (tokens_in_last_block) is the same for every layer, so this
+        can be called once to build a shared slot-index GPU tensor.
+
+        The actual block allocations, CoW handling, and counter updates
+        are still done per-layer by ``append_tokens_batched``.
 
         Returns:
-            per_layer_block_indices: list of num_layers lists, each of
-                length N — the destination block index for each
-                sequence in each layer.  In the common case (no CoW)
-                all layers share the same list; after CoW they may
-                diverge.
-            slot_indices: list[int] of N slot offsets — identical
-                across all layers.
+            slot_indices: list[int] of N slot offsets.
         """
-        N = len(seq_ids)
-        # Pre-fill per-layer block index storage
-        per_layer_block_indices: list[list[int]] = [
-            [] for _ in range(self.num_layers)
-        ]
         slot_indices: list[int] = []
-
         for seq_id in seq_ids:
             seq = self._sequences[seq_id]
+            # If the last block is full (or no blocks exist), the next
+            # append will allocate a new block and write to slot 0.
+            if (not seq.page_table[0]
+                    or seq.tokens_in_last_block[0] == self.block_size):
+                slot_indices.append(0)
+            else:
+                slot_indices.append(seq.tokens_in_last_block[0])
+        return slot_indices
 
-            # Need a new block?  Check layer 0 as the reference.
-            need_new_block = (
-                not seq.page_table[0]
-                or seq.tokens_in_last_block[0] == self.block_size
-            )
-            if need_new_block:
-                # Allocate one block per layer so pools stay independent.
-                for layer_idx in range(self.num_layers):
-                    new_blk = self.allocator.alloc()
-                    seq.page_table[layer_idx].append(new_blk)
-                    seq.tokens_in_last_block[layer_idx] = 0
-
-            # CoW: check layer 0's tail block as the shared-refcount proxy.
-            tail_blk_0 = seq.page_table[0][-1]
-            if self.allocator.is_shared(tail_blk_0):
-                for layer_idx in range(self.num_layers):
-                    old_blk = seq.page_table[layer_idx][-1]
-                    new_blk = self.allocator.alloc()
-                    self.k_pools[layer_idx][new_blk].copy_(
-                        self.k_pools[layer_idx][old_blk]
-                    )
-                    self.v_pools[layer_idx][new_blk].copy_(
-                        self.v_pools[layer_idx][old_blk]
-                    )
-                    self.allocator.release(old_blk)
-                    seq.page_table[layer_idx][-1] = new_blk
-
-            # Record the slot (same for all layers) and per-layer blocks.
-            slot_indices.append(seq.tokens_in_last_block[0])
-            for layer_idx in range(self.num_layers):
-                per_layer_block_indices[layer_idx].append(
-                    seq.page_table[layer_idx][-1]
-                )
-
-            # Update counters for ALL layers
-            for layer_idx in range(self.num_layers):
-                seq.tokens_in_last_block[layer_idx] += 1
-                seq.num_tokens[layer_idx] += 1
-
-        return per_layer_block_indices, slot_indices
-
-    def apply_append_batched(
+    def append_tokens_batched_fast(
         self,
+        seq_ids: list[int],
         layer_idx: int,
         k: torch.Tensor,
         v: torch.Tensor,
-        block_idx_t: torch.Tensor,
         slot_idx_t: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         """
-        Execute the GPU scatter-write for a single layer using
-        precomputed index tensors.
+        Append 1 token for N sequences using a precomputed slot-index
+        tensor.
 
-        Args:
-            layer_idx:   which layer's pool to write into.
-            k, v:        (N, num_kv_heads, head_dim) new KV to write.
-            block_idx_t: (N,) int64 tensor of destination block indices.
-            slot_idx_t:  (N,) int64 tensor of destination slot offsets.
+        Performs the same block allocation, CoW, and counter updates as
+        ``append_tokens_batched`` but skips creating the slot-index GPU
+        tensor (reuses ``slot_idx_t``).  Still builds the block-index
+        tensor per-layer since block indices diverge across layers
+        after CoW.
+
+        Returns:
+            block_idx_t: (N,) int64 tensor of destination block indices
+                         (on device).  Callers may discard this.
         """
+        N = len(seq_ids)
+        block_indices: list[int] = []
+
+        for seq_id in seq_ids:
+            seq = self._sequences[seq_id]
+            page_table = seq.page_table[layer_idx]
+
+            if not page_table or seq.tokens_in_last_block[layer_idx] == self.block_size:
+                new_blk = self.allocator.alloc()
+                page_table.append(new_blk)
+                seq.tokens_in_last_block[layer_idx] = 0
+
+            tail_blk = page_table[-1]
+
+            if self.allocator.is_shared(tail_blk):
+                new_blk = self.allocator.alloc()
+                self.k_pools[layer_idx][new_blk].copy_(
+                    self.k_pools[layer_idx][tail_blk]
+                )
+                self.v_pools[layer_idx][new_blk].copy_(
+                    self.v_pools[layer_idx][tail_blk]
+                )
+                self.allocator.release(tail_blk)
+                page_table[-1] = new_blk
+                tail_blk = new_blk
+
+            block_indices.append(tail_blk)
+
+            seq.tokens_in_last_block[layer_idx] += 1
+            seq.num_tokens[layer_idx] += 1
+
+        block_idx_t = torch.tensor(
+            block_indices, device=self.device, dtype=torch.long,
+        )
         self.k_pools[layer_idx][block_idx_t, slot_idx_t] = k
         self.v_pools[layer_idx][block_idx_t, slot_idx_t] = v
+        return block_idx_t
 
     def append_tokens_batched(
         self,
@@ -380,35 +381,37 @@ class PagedKVCacheManager:
         # All layers should have the same logical length, so reading layer 0 is safe
         return self._sequences[seq_id].num_tokens[0]
 
-    def prepare_gather_indices(
+    def prepare_gather_metadata(
         self,
         seq_ids: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, int, list[int]] | None:
         """
-        Precompute the gather index tensors and cu_seqlens_k that are
+        Precompute the layer-invariant parts of the KV gather that are
         shared across all layers for a given batch of sequences.
 
-        Because blocks are allocated symmetrically (every layer gets the
-        same page-table structure), the (block_idx, slot_idx) gather
-        pattern is identical for every layer.  Call this once before the
-        layer loop and pass the result to ``build_packed_kv`` to avoid
-        re-building and re-uploading these small tensors L times per
-        decode step.
+        The *slot* layout within blocks is identical across all layers
+        (each layer has the same number of tokens per sequence, arranged
+        the same way within blocks).  The *block indices* differ per
+        layer (each layer's pool is independent), so they must still be
+        built per-layer inside ``build_packed_kv``.
+
+        Call this once before the layer loop and pass the result to
+        ``build_packed_kv`` to avoid re-building slot indices,
+        cu_seqlens_k, and seq_lengths L times per step.
 
         Returns:
-            (blk_t, slt_t, cu_seqlens_k, max_seqlen_k) or None if the
-            batch is empty.
+            (slt_t, cu_seqlens_k, max_seqlen_k, seq_lengths) or None
+            if the batch is empty.
 
-            blk_t:        (total_tokens,) int64 block indices on device
-            slt_t:        (total_tokens,) int64 slot  indices on device
+            slt_t:        (total_tokens,) int64 slot indices on device
             cu_seqlens_k: (N+1,) int32 cumulative seq lengths on device
             max_seqlen_k: int — longest sequence in the batch
+            seq_lengths:  list[int] of per-sequence token counts
         """
         seq_lengths: list[int] = []
-        block_indices: list[int] = []
         slot_indices: list[int] = []
 
-        # Use layer 0 — symmetric with all other layers.
+        # Use layer 0 for lengths — all layers are in sync.
         for sid in seq_ids:
             seq = self._sequences[sid]
             seq_len = seq.num_tokens[0]
@@ -417,7 +420,6 @@ class PagedKVCacheManager:
             tokens_remaining = seq_len
             for blk_idx in seq.page_table[0]:
                 n = min(self.block_size, tokens_remaining)
-                block_indices.extend([blk_idx] * n)
                 slot_indices.extend(range(n))
                 tokens_remaining -= n
                 if tokens_remaining == 0:
@@ -429,36 +431,36 @@ class PagedKVCacheManager:
 
         max_seqlen_k = max(seq_lengths) if seq_lengths else 0
 
-        blk_t = torch.tensor(block_indices, device=self.device, dtype=torch.long)
-        slt_t = torch.tensor(slot_indices,  device=self.device, dtype=torch.long)
+        slt_t = torch.tensor(slot_indices, device=self.device, dtype=torch.long)
 
         cu_cpu = torch.zeros(len(seq_ids) + 1, dtype=torch.int32)
         for i, l in enumerate(seq_lengths):
             cu_cpu[i + 1] = cu_cpu[i] + l
         cu_seqlens_k = cu_cpu.to(self.device, non_blocking=True)
 
-        return blk_t, slt_t, cu_seqlens_k, max_seqlen_k
+        return slt_t, cu_seqlens_k, max_seqlen_k, seq_lengths
 
     def build_packed_kv(
         self,
         seq_ids: list[int],
         layer_idx: int,
-        cached_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
+        cached_metadata: tuple[torch.Tensor, torch.Tensor, int, list[int]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Gather K and V for all sequences into a single packed (varlen) tensor.
 
-        If ``cached_indices`` is provided (from ``prepare_gather_indices``),
-        skips index construction and GPU upload entirely — just does the
-        two gather kernels.  This saves 2 × torch.tensor() allocations and
-        CPU→GPU transfers per layer after the first.
+        If ``cached_metadata`` is provided (from ``prepare_gather_metadata``),
+        reuses the precomputed slot index tensor, cu_seqlens_k, and
+        seq_lengths — only the per-layer block index tensor is built
+        fresh.  This saves 1 torch.tensor() + 1 CPU→GPU transfer
+        (slot indices) and the cu_seqlens construction per layer.
 
         Args:
-            seq_ids:        list of N paged-cache sequence ids.
-            layer_idx:      which transformer layer to gather from.
-            cached_indices: optional precomputed (blk_t, slt_t,
-                            cu_seqlens_k, max_seqlen_k) from
-                            ``prepare_gather_indices``.
+            seq_ids:          list of N paged-cache sequence ids.
+            layer_idx:        which transformer layer to gather from.
+            cached_metadata:  optional precomputed (slt_t, cu_seqlens_k,
+                              max_seqlen_k, seq_lengths) from
+                              ``prepare_gather_metadata``.
 
         Returns:
             packed_k:    (total_tokens, num_kv_heads, head_dim)
@@ -469,55 +471,60 @@ class PagedKVCacheManager:
         k_pool = self.k_pools[layer_idx]
         v_pool = self.v_pools[layer_idx]
 
-        # --- Fast path: use precomputed indices ---
-        if cached_indices is not None:
-            blk_t, slt_t, cu_seqlens_k, max_seqlen_k = cached_indices
-            packed_k = k_pool[blk_t, slt_t]
-            packed_v = v_pool[blk_t, slt_t]
-            return packed_k, packed_v, cu_seqlens_k, max_seqlen_k
+        # --- Build per-layer block indices (always needed) ---
+        if cached_metadata is not None:
+            slt_t, cu_seqlens_k, max_seqlen_k, seq_lengths = cached_metadata
+        else:
+            # Full fallback — build everything from scratch
+            seq_lengths = []
+            slot_indices = []
+            for sid in seq_ids:
+                seq = self._sequences[sid]
+                seq_len = seq.num_tokens[layer_idx]
+                seq_lengths.append(seq_len)
+                tokens_remaining = seq_len
+                for blk_idx in seq.page_table[layer_idx]:
+                    n = min(self.block_size, tokens_remaining)
+                    slot_indices.extend(range(n))
+                    tokens_remaining -= n
+                    if tokens_remaining == 0:
+                        break
 
-        # --- Slow path: build indices from scratch (fallback) ---
-        seq_lengths: list[int] = []
+            total_tokens = sum(seq_lengths)
+            max_seqlen_k = max(seq_lengths) if seq_lengths else 0
+
+            if total_tokens == 0:
+                empty = torch.empty(
+                    0, self.num_key_value_heads, self.head_dim,
+                    device=self.device, dtype=self.dtype,
+                )
+                cu = torch.zeros(
+                    len(seq_ids) + 1, device=self.device, dtype=torch.int32,
+                )
+                return empty, empty, cu, 0
+
+            slt_t = torch.tensor(slot_indices, device=self.device, dtype=torch.long)
+            cu_cpu = torch.zeros(len(seq_ids) + 1, dtype=torch.int32)
+            for i, l in enumerate(seq_lengths):
+                cu_cpu[i + 1] = cu_cpu[i] + l
+            cu_seqlens_k = cu_cpu.to(self.device, non_blocking=True)
+
+        # Per-layer block indices — always built fresh per layer.
         block_indices: list[int] = []
-        slot_indices: list[int] = []
-
-        for sid in seq_ids:
+        for sid, seq_len in zip(seq_ids, seq_lengths):
             seq = self._sequences[sid]
-            seq_len = seq.num_tokens[layer_idx]
-            seq_lengths.append(seq_len)
-
             tokens_remaining = seq_len
             for blk_idx in seq.page_table[layer_idx]:
                 n = min(self.block_size, tokens_remaining)
                 block_indices.extend([blk_idx] * n)
-                slot_indices.extend(range(n))
                 tokens_remaining -= n
                 if tokens_remaining == 0:
                     break
 
-        total_tokens = sum(seq_lengths)
-        max_seqlen_k = max(seq_lengths) if seq_lengths else 0
-
-        if total_tokens == 0:
-            empty = torch.empty(
-                0, self.num_key_value_heads, self.head_dim,
-                device=self.device, dtype=self.dtype,
-            )
-            cu = torch.zeros(
-                len(seq_ids) + 1, device=self.device, dtype=torch.int32,
-            )
-            return empty, empty, cu, 0
-
         blk_t = torch.tensor(block_indices, device=self.device, dtype=torch.long)
-        slt_t = torch.tensor(slot_indices,  device=self.device, dtype=torch.long)
 
         packed_k = k_pool[blk_t, slt_t]
         packed_v = v_pool[blk_t, slt_t]
-
-        cu_cpu = torch.zeros(len(seq_ids) + 1, dtype=torch.int32)
-        for i, l in enumerate(seq_lengths):
-            cu_cpu[i + 1] = cu_cpu[i] + l
-        cu_seqlens_k = cu_cpu.to(self.device, non_blocking=True)
 
         return packed_k, packed_v, cu_seqlens_k, max_seqlen_k
 

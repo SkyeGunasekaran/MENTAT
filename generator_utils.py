@@ -336,10 +336,19 @@ class PagedModelWrapper:
         cache layer-by-layer, then attention gathers from the full
         history (including the just-appended token).
 
-        Optimisation: index tensors for both the append scatter-write
-        and the KV gather are computed once before the layer loop and
-        reused across all layers, eliminating 4 × num_layers redundant
-        ``torch.tensor()`` allocations + CPU→GPU transfers per step.
+        Optimisations over the naive per-layer path:
+          - Append: slot-index GPU tensor is built once and reused
+            across all layers (slots are always layer-invariant).
+            Block allocations, CoW, and counter updates remain per-layer
+            to preserve correctness.
+          - Gather: slot-index tensor, cu_seqlens_k, and seq_lengths
+            are computed once (after layer 0's append) and reused for
+            layers 1..L-1.  Only the per-layer block-index tensor is
+            rebuilt each layer.
+
+        Net savings per step: eliminates (L-1) slot-index tensor
+        allocations for append + (L-1) slot-index, cu_seqlens, and
+        seq_lengths constructions for gather.
 
         Args:
             token_ids_per_seq: list of N token ids (one per leaf).
@@ -371,18 +380,18 @@ class PagedModelWrapper:
             self.kv_cache_mgr.get_kv_length(sid) for sid in seq_ids
         ]
 
-        # -- Precompute append write destinations (once for all layers) --
-        # This performs all block allocations and CoW copies upfront.
-        # Slot indices are identical across layers (one tensor).
-        # Block indices may differ per layer (after CoW), so we upload
-        # one small tensor per layer — still far cheaper than the old
-        # path which also re-ran all Python bookkeeping per layer.
-        per_layer_blk_indices, append_slt_indices = (
-            self.kv_cache_mgr.prepare_append_batched(seq_ids)
+        # -- Precompute the shared slot-index tensor for appends --
+        # Slot offsets are identical across all layers because
+        # tokens_in_last_block is always in sync.  Build the GPU
+        # tensor once and reuse it L times.
+        append_slt_indices = (
+            self.kv_cache_mgr.prepare_append_slot_indices(seq_ids)
         )
         append_slt_t = torch.tensor(
             append_slt_indices, device=self.device, dtype=torch.long,
         )
+
+        cached_gather_meta = None
 
         for layer_idx, block in enumerate(self.layers):
             residual = hidden
@@ -394,25 +403,24 @@ class PagedModelWrapper:
                 block.self_attn, attn_input, seq_ids, seqlen_offsets,
             )
 
-            # Step 2: Append new K/V using precomputed indices.
-            append_blk_t = torch.tensor(
-                per_layer_blk_indices[layer_idx],
-                device=self.device, dtype=torch.long,
-            )
-            self.kv_cache_mgr.apply_append_batched(
+            # Step 2: Append new K/V into paged cache.
+            # Per-layer bookkeeping (block alloc, CoW, counter updates)
+            # happens inside; only the slot-index tensor is shared.
+            self.kv_cache_mgr.append_tokens_batched_fast(
+                seq_ids=seq_ids,
                 layer_idx=layer_idx,
                 k=k_new,
                 v=v_new,
-                block_idx_t=append_blk_t,
                 slot_idx_t=append_slt_t,
             )
 
-            # Step 3: Precompute gather indices AFTER the first layer's
-            # append (layer 0) so they include the just-appended tokens.
-            # This is computed once and reused for layers 1..L-1.
+            # Step 3: After layer 0's append, build the gather metadata
+            # (slot indices, cu_seqlens, seq_lengths) that is shared
+            # across all layers.  Block indices still differ per layer
+            # and are built inside build_packed_kv.
             if layer_idx == 0:
-                cached_gather = self.kv_cache_mgr.prepare_gather_indices(
-                    seq_ids,
+                cached_gather_meta = (
+                    self.kv_cache_mgr.prepare_gather_metadata(seq_ids)
                 )
 
             # Step 4: Run Q-only attention reading from paged cache
@@ -421,7 +429,7 @@ class PagedModelWrapper:
                 kv_cache_mgr=self.kv_cache_mgr,
                 seq_ids=seq_ids,
                 seqlen_offsets=seqlen_offsets,
-                cached_gather_indices=cached_gather,
+                cached_gather_indices=cached_gather_meta,
             )
 
             # -- Residual + MLP --
