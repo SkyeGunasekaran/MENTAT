@@ -8,16 +8,12 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ---------------------------------------------------------------------------
-# 1. Register the custom model with HuggingFace's Auto* machinery
+# 1. Import the model-agnostic Paged Attention Injector
 # ---------------------------------------------------------------------------
-from models.qwen3.configuration_qwen3 import Qwen3Config
-from models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-
-AutoConfig.register("qwen3", Qwen3Config, exist_ok=True)
-AutoModelForCausalLM.register(Qwen3Config, Qwen3ForCausalLM, exist_ok=True)
+from paged_attention_injector import inject_paged_attention
 
 # ---------------------------------------------------------------------------
 # 2. Import the paged UQ generator
@@ -34,7 +30,6 @@ DEFAULT_PROMPTS = [
     "Once upon a time, in a kingdom far away,",
     "The key difference between classical and quantum computing is",
 ]
-
 
 # ---------------------------------------------------------------------------
 # 4. Pretty-printing helpers
@@ -154,8 +149,7 @@ def serialize_results(
             'kv_blocks_peak': diagnostics['kv_blocks_peak'],
             'kv_blocks_total': diagnostics['kv_blocks_total'],
             'kv_peak_utilization': diagnostics['kv_peak_utilization'],
-            # branch evolution: list of length == decode steps taken;
-            # active_branch_trace[i] = number of live branches at step i.
+            # branch evolution
             'active_branch_trace': diagnostics.get('active_branch_trace', []),
         },
         'diagnostics': {
@@ -181,7 +175,6 @@ def serialize_results(
             ],
         },
     }
-
 
 # ---------------------------------------------------------------------------
 # 6. Main
@@ -259,6 +252,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # We now load standard HF models directly without custom AutoModel registrations
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
@@ -270,6 +264,10 @@ def main():
     print(f"  Vocab size:  {model.config.vocab_size}")
     print(f"  Layers:      {model.config.num_hidden_layers}")
     print(f"  Hidden:      {model.config.hidden_size}")
+
+    # ---- INJECT PAGED ATTENTION ----
+    print("  Injecting model-agnostic paged attention...")
+    inject_paged_attention(model)
 
     # ---- UQ parameters summary ----
     print_header("UQ Configuration (Paged Batched)")
@@ -296,9 +294,11 @@ def main():
         print_header(f"Generating [{i+1}/{len(prompts)}]")
         print(f'  Prompt: "{prompt}"')
 
+        # Notice how we just pass the standard model, but under the hood, 
+        # the generator will now be calling the newly injected paged methods!
         gen = PagedPrefixTreeUQGenerator(
-            model,
-            tokenizer,
+            model=model,
+            tokenizer=tokenizer,
             max_active_branches=args.max_active,
             branching_factor=args.branching_factor,
             relative_entropy_multiplier=args.relative_entropy_multiplier,

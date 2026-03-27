@@ -221,9 +221,6 @@ class PagedPrefixTreeUQGenerator:
                         continue
                     self._step_leaf(tree, leaf, leaf_logits, step, num_active)
 
-            # -- Log-prob gap prune (runs in both phases) --
-            self._prune(tree, step)
-
             # -- Semantic diversity prune (convergence phase only) --
             if not in_exploration:
                 self._prune_similar(tree, step)
@@ -511,24 +508,20 @@ class PagedPrefixTreeUQGenerator:
                 leaf.semantic_vector.mul_(1.0 - alpha).add_(h, alpha=alpha)
     def _prune_similar(self, tree: PrefixTree, step: int):
         """
-        Pairwise cosine-similarity diversity pruning.
-
-        Stacks all active-leaf semantic vectors into an (N, D) matrix,
-        computes the full (N, N) cosine similarity on GPU in one
-        batched operation, and prunes the lower-probability branch
-        from any pair exceeding the similarity threshold.
+        Pairwise cosine-similarity diversity pruning with threshold annealing.
+        Gives branches a grace period after the exploration phase to diverge
+        semantically before aggressively pruning them.
         """
         leaves = tree.get_active_leaves()
         N = len(leaves)
         if N <= 1:
             return
 
-        # Filter to leaves that have a semantic vector (skip any
-        # that haven't been through a decode step yet).
+        # Filter to leaves that have a semantic vector
         sv_leaves: list[TreeNode] = []
         sv_list: list[torch.Tensor] = []
         for leaf in leaves:
-            if leaf.semantic_vector is not None and leaf.creation_step < step: # FIX IS HERE
+            if leaf.semantic_vector is not None and leaf.creation_step < step:
                 sv_leaves.append(leaf)
                 sv_list.append(leaf.semantic_vector)
 
@@ -536,23 +529,30 @@ class PagedPrefixTreeUQGenerator:
         if M <= 1:
             return
 
+        # --- Threshold Annealing Logic ---
+        anneal_duration = 20  # Number of steps to glide down to the target threshold
+        steps_past_explore = step - self.exploration_window
+        
+        if steps_past_explore < anneal_duration:
+            # Linear decay from 1.0 down to your target threshold
+            progress = steps_past_explore / anneal_duration
+            current_threshold = 1.0 - (progress * (1.0 - self.semantic_similarity_threshold))
+        else:
+            current_threshold = self.semantic_similarity_threshold
+
         # (M, D) — stack on GPU, no copies to CPU
-        sv_matrix = torch.stack(sv_list, dim=0)  # already on device
+        sv_matrix = torch.stack(sv_list, dim=0)
 
         # Batched pairwise cosine similarity: O(M^2) on GPU
-        # F.normalize + mm is a single fused path on CUDA.
-        sv_normed = F.normalize(sv_matrix, p=2, dim=1)  # (M, D)
-        sim_matrix = torch.mm(sv_normed, sv_normed.t())  # (M, M)
+        sv_normed = F.normalize(sv_matrix, p=2, dim=1)
+        sim_matrix = torch.mm(sv_normed, sv_normed.t())
 
-        # Mask the diagonal and lower triangle so each pair is only
-        # considered once (and a leaf is never compared to itself).
+        # Mask the diagonal and lower triangle
         mask = torch.triu(torch.ones(M, M, device=sim_matrix.device, dtype=torch.bool), diagonal=1)
         sim_matrix = sim_matrix * mask
 
-        # Find pairs above threshold — GPU comparison, then a small
-        # transfer of the indices (typically very few pairs).
-        above = (sim_matrix > self.semantic_similarity_threshold).nonzero(as_tuple=False)
-        # above: (P, 2) where P is number of violating pairs
+        # Find pairs above the DYNAMIC threshold
+        above = (sim_matrix > current_threshold).nonzero(as_tuple=False)
 
         if above.shape[0] == 0:
             return
@@ -566,12 +566,11 @@ class PagedPrefixTreeUQGenerator:
             leaf_i = sv_leaves[i_idx]
             leaf_j = sv_leaves[j_idx]
 
-            # Skip if either was already pruned this step
             if leaf_i.node_id in to_prune or leaf_j.node_id in to_prune:
                 continue
 
-            # Keep the branch with higher cumulative log-prob
-            if leaf_i.cumulative_log_prob / leaf_i.depth >= leaf_j.cumulative_log_prob / leaf_j.depth:
+            # Keep the branch with higher length-normalized cumulative log-prob
+            if leaf_i.cumulative_log_prob / max(leaf_i.depth, 1) >= leaf_j.cumulative_log_prob / max(leaf_j.depth, 1):
                 to_prune.add(leaf_j.node_id)
             else:
                 to_prune.add(leaf_i.node_id)
@@ -585,22 +584,6 @@ class PagedPrefixTreeUQGenerator:
 
         if pruned:
             self.diversity_pruning_events.append((step, pruned))
-
-    def _prune(self, tree: PrefixTree, step: int):
-        """Remove branches whose log-prob is too far below the best."""
-        leaves = tree.get_active_leaves()
-        if len(leaves) <= 1:
-            return
-
-        best_lp = max(l.cumulative_log_prob / max(l.depth, 1) for l in leaves)
-        pruned = 0
-        for leaf in leaves:
-            if best_lp - (leaf.cumulative_log_prob / max(leaf.depth, 1)) > self.prune_gap:
-                tree.prune_branch(leaf)
-                pruned += 1
-
-        if pruned:
-            self.pruning_events.append((step, pruned))
 
     # ------------------------------------------------------------------
     #  Diagnostics

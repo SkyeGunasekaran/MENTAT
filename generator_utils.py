@@ -8,7 +8,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from paged_kv_cache import PagedKVCacheManager
+from paged_attention_injector import PagedKVCacheManager
 
 
 # ============================================================================
@@ -260,14 +260,17 @@ class PagedModelWrapper:
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
 
-        # Extract model internals
-        # TransformerForCausalLM → .model (TransformerModel)
         base = model.model if hasattr(model, 'model') else model
         self.embeddings = base.embed_tokens
-        self.layers = base.layers          # nn.ModuleList[TransformerBlock]
+        self.layers = base.layers
         self.final_norm = base.norm
         self.lm_head = model.lm_head
         self.config = model.config
+
+        # --- Duck Type Normalization Layers ---
+        first_block = self.layers[0]
+        self._norm1_attr = next(name for name in ['input_layernorm', 'ln_1', 'attention_norm'] if hasattr(first_block, name))
+        self._norm2_attr = next(name for name in ['post_attention_layernorm', 'ln_2', 'ffn_norm'] if hasattr(first_block, name))
 
     # ------------------------------------------------------------------
     #  Prefill — single sequence
@@ -296,7 +299,7 @@ class PagedModelWrapper:
             # -- Attention (paged prefill) --
             residual = hidden
             # REPLACED: attn_input = block.attn_norm(hidden)
-            attn_input = block.input_layernorm(hidden)
+            attn_input = getattr(block, self._norm1_attr)(hidden)
 
             # REPLACED: block.attn.forward_paged_prefill
             attn_out, k_new, v_new = block.self_attn.forward_paged_prefill(
@@ -310,7 +313,7 @@ class PagedModelWrapper:
             residual = hidden
 
             # REPLACED: hidden = block.mlp_norm(hidden)
-            hidden = block.post_attention_layernorm(hidden)
+            hidden = getattr(block, self._norm2_attr)(hidden)
 
             hidden = block.mlp(hidden)
             hidden = residual + hidden
@@ -396,7 +399,7 @@ class PagedModelWrapper:
         for layer_idx, block in enumerate(self.layers):
             residual = hidden
 
-            attn_input = block.input_layernorm(hidden)
+            attn_input = getattr(block, self._norm1_attr)(hidden)
 
             # Step 1: Project K/V + RoPE for the new decode tokens.
             k_new, v_new = self._project_kv(
@@ -436,7 +439,7 @@ class PagedModelWrapper:
             hidden = residual + attn_out
             residual = hidden
 
-            hidden = block.post_attention_layernorm(hidden)
+            hidden = getattr(block, self._norm2_attr)(hidden)
 
             hidden = block.mlp(hidden)
             hidden = residual + hidden
@@ -478,36 +481,7 @@ class PagedModelWrapper:
             k: (N, num_key_value_heads, head_dim) — post-RoPE K.
             v: (N, num_key_value_heads, head_dim) — V (no RoPE applied).
         """
-        from einops import rearrange as _rearrange
-
-        head_dim = attn_module.head_dim
-        N = len(seq_ids)
-
-        k = _rearrange(
-            attn_module.k_proj(hidden_states),
-            '... (h d) -> ... h d', d=head_dim,
-        )
-        v = _rearrange(
-            attn_module.v_proj(hidden_states),
-            '... (h d) -> ... h d', d=head_dim,
-        )
-        # k, v: (1, N, num_key_value_heads, head_dim)
-
-        if attn_module.qk_norm:
-            k = attn_module.k_norm(k)
-
-        # Apply RoPE to K using Qwen3-compatible varlen interface.
-        # Each decode token has its own position = seqlen_offsets[i].
-        positions = torch.tensor(
-            seqlen_offsets, device=k.device, dtype=torch.long,
-        )
-        # Squeeze to (N, num_kv_heads, head_dim) for varlen application
-        k_squeezed = k.squeeze(0)
-        k_rotated = attn_module.rotary.apply_varlen(k_squeezed, positions)
-
-        v_out = v.squeeze(0)  # (N, num_key_value_heads, head_dim)
-
-        return k_rotated, v_out
+        return attn_module.project_kv_paged(hidden_states, seqlen_offsets)
 
     # ------------------------------------------------------------------
     def is_eos(self, token_id: int) -> bool:
