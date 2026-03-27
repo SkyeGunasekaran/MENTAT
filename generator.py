@@ -56,7 +56,6 @@ class PagedPrefixTreeUQGenerator:
         max_blocks: int | None = None,
         # Semantic diversity pruning
         semantic_similarity_threshold: float = 0.95,
-        ema_alpha: float = 0.3,
         # Exploration window
         exploration_window: int = 10,
         exploration_percentile: float = 0.99,
@@ -77,7 +76,6 @@ class PagedPrefixTreeUQGenerator:
         self.freq_penalty = frequency_penalty
         self.max_ngram_block = max_ngram_block
         self.semantic_similarity_threshold = semantic_similarity_threshold
-        self.ema_alpha = ema_alpha
         self.exploration_window = exploration_window
         self.exploration_percentile = exploration_percentile
 
@@ -307,15 +305,12 @@ class PagedPrefixTreeUQGenerator:
         num_active: int,
     ):
         """
-        Exploration-phase step: entropy-gated branching on high-percentile
-        tokens.
+        Exploration-phase step: force-branch on all tokens above the
+        configured percentile, up to a hard per-leaf cap of K and
+        global max_active headroom.
 
-        Branches when the model is uncertain (entropy exceeds the
-        per-sequence EMA baseline), using a softer threshold than the
-        convergence phase to encourage broader exploration.  When the
-        model is confident (entropy below baseline), greedy-extends
-        instead of wasting branch budget on positions where the top
-        token is near-certain.
+        If only one token qualifies (or no headroom), falls back to
+        greedy extend.
         """
         entropy = compute_entropy(logits, self.temperature)
         self.entropy_trace.append((step, leaf.node_id, entropy))
@@ -324,16 +319,13 @@ class PagedPrefixTreeUQGenerator:
         if leaf.entropy_ema is None:
             leaf.entropy_ema = entropy
         else:
-            leaf.entropy_ema = (
-                self.entropy_ema_alpha * entropy
-                + (1.0 - self.entropy_ema_alpha) * leaf.entropy_ema
-            )
+            leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
 
-        # Dynamic threshold — same capacity-aware scaling as convergence,
-        # but we use the raw EMA as the baseline (no extra multiplier)
-        # so exploration is more willing to branch than convergence.
+        # Calculate the dynamic threshold
+        # We scale the relative multiplier by tree utilization to preserve your memory safety mechanism
         util = num_active / max(self.M, 1)
-        dynamic_multiplier = 1.0 + 2.0 * util * util
+        dynamic_multiplier = self.relative_entropy_multiplier * (1.0 + 2.0 * util * util)
+        
         tau = leaf.entropy_ema * dynamic_multiplier
 
         seq_so_far = leaf.get_full_sequence()
@@ -347,11 +339,7 @@ class PagedPrefixTreeUQGenerator:
 
         headroom = self.M - num_active
 
-        # Gate on entropy: only branch when the model is actually
-        # uncertain (entropy above the adaptive baseline).  This
-        # conserves branch budget for positions where branching
-        # discovers genuinely distinct continuations.
-        if headroom >= 2 and entropy > tau:
+        if headroom >= 2:
             self._do_branch_explore(tree, leaf, penalized, step, headroom)
         else:
             self._do_extend(tree, leaf, penalized)
@@ -503,24 +491,24 @@ class PagedPrefixTreeUQGenerator:
         hidden_states: torch.Tensor,
     ):
         """
-        Update each leaf's semantic vector using EMA of the new hidden state.
+        Update each leaf's semantic vector using a true running mean 
+        of the new hidden state to prevent recency bias.
 
         All arithmetic stays on GPU — no .item() or .tolist() calls.
-
-        Args:
-            leaves: list of N active leaves (same order as the batch).
-            hidden_states: (N, D) final hidden states from decode_batch,
-                           already on GPU.
         """
-        alpha = self.ema_alpha
         for i, leaf in enumerate(leaves):
             h = hidden_states[i]  # (D,) — stays on device
             if leaf.semantic_vector is None:
                 leaf.semantic_vector = h.clone()
             else:
-                # EMA: v_new = α * h + (1 − α) * v_old
+                # Calculate dynamic alpha for a true running mean.
+                # Since leaf.depth hasn't been incremented for this step yet, 
+                # the total sequence length represented is leaf.depth + 1.
+                current_length = max(leaf.depth + 1, 2)
+                alpha = 1.0 / current_length
+                
+                # True running mean: v_new = α * h + (1 − α) * v_old
                 leaf.semantic_vector.mul_(1.0 - alpha).add_(h, alpha=alpha)
-
     def _prune_similar(self, tree: PrefixTree, step: int):
         """
         Pairwise cosine-similarity diversity pruning.

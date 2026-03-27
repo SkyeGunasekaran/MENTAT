@@ -216,7 +216,6 @@ def main():
 
     # Semantic diversity pruning
     parser.add_argument("--sim_threshold", type=float, default=0.90)
-    parser.add_argument("--ema_alpha", type=float, default=0.2)
 
     # Exploration window
     parser.add_argument("--exploration_window", type=int, default=15)
@@ -284,7 +283,6 @@ def main():
     print(f"  freq_penalty:      {args.freq_penalty}")
     print(f"  ngram_block:       {args.ngram_block}")
     print(f"  sim_threshold:     {args.sim_threshold}")
-    print(f"  ema_alpha:         {args.ema_alpha}")
     print(f"  explore_window:    {args.exploration_window}")
     print(f"  explore_pctile:    {args.exploration_percentile}")
     print(f"  block_size:        {args.block_size}")
@@ -313,7 +311,6 @@ def main():
             block_size=args.block_size,
             max_blocks=args.max_blocks,
             semantic_similarity_threshold=args.sim_threshold,
-            ema_alpha=args.ema_alpha,
             exploration_window=args.exploration_window,
             exploration_percentile=args.exploration_percentile,
         )
@@ -362,7 +359,6 @@ def main():
                 'freq_penalty': args.freq_penalty,
                 'ngram_block': args.ngram_block,
                 'sim_threshold': args.sim_threshold,
-                'ema_alpha': args.ema_alpha,
                 'exploration_window': args.exploration_window,
                 'exploration_percentile': args.exploration_percentile,
                 'block_size': args.block_size,
