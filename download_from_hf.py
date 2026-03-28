@@ -4,15 +4,12 @@ import os
 from huggingface_hub import snapshot_download
 
 MODELS = {
-    "mistral": [
-        "mistralai/Ministral-3-3B-Instruct-2512",
-    ],
     "llama": [
-        "meta-llama/Llama-3.1-8B-Instruct",
-        "meta-llama/Llama-3.1-70B-Instruct",
-        "meta-llama/Llama-3.2-1B-Instruct",
+        #"meta-llama/Llama-3.1-8B-Instruct",
+        #"meta-llama/Llama-3.1-70B-Instruct",
+        #"meta-llama/Llama-3.2-1B-Instruct",
         "meta-llama/Llama-3.2-3B-Instruct",
-        "meta-llama/Llama-3.3-70B-Instruct",
+        #"meta-llama/Llama-3.3-70B-Instruct",
     ],
     "qwen": [
         #"Qwen/Qwen3-0.6B",
@@ -24,7 +21,7 @@ MODELS = {
     ],
 }
 
-CACHE_DIR = '/workspace/MENTAT/hf_models'
+CACHE_DIR = 'hf_models'
 
 def download(models):
     for name in models:

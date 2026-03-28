@@ -1,3 +1,29 @@
+"""
+Prefix-Tree Uncertainty Quantification Generator — Paged Batched Edition
+=========================================================================
+
+Entropy-gated branching over a TransformerForCausalLM model, using
+paged KV-cache and batched decoding for throughput.
+
+Key differences from the original:
+  • TreeNode stores a ``seq_id`` (int) instead of a full FLACache.
+  • Branching uses ``kv_cache_mgr.fork_sequence()`` (O(1) page-table
+    copy + refcount bumps) instead of ``clone_cache()`` (full tensor
+    deep-copy).
+  • All active leaves are decoded in a **single batched forward pass**
+    per step via ``flash_attn_varlen_func``, rather than N sequential
+    ``decode_one`` calls.
+  • Pruning calls ``kv_cache_mgr.free_sequence()`` to release pages.
+
+Usage:
+    from paged_kv_cache import PagedKVCacheManager
+
+    model = TransformerForCausalLM.from_pretrained(...)
+    tokenizer = AutoTokenizer.from_pretrained(...)
+    gen = PagedPrefixTreeUQGenerator(model, tokenizer)
+    results = gen.generate("The meaning of life is")
+"""
+
 from __future__ import annotations
 
 import math
@@ -27,7 +53,7 @@ class TreeNode:
     is_active: bool = True
     is_eos: bool = False
     semantic_vector: Optional[torch.Tensor] = None  
-    entropy_ema: Optional[float] = None   # Track local entropy baseline          
+    entropy_ema: Optional[float] = None             # NEW: Track local entropy baseline
     creation_step: int = 0
 
     def get_full_sequence(self) -> list[int]:
@@ -150,7 +176,7 @@ class PrefixTree:
 
 
 # ============================================================================
-# 2.  Entropy & Penalty Utils  
+# 2.  ENTROPY / PENALTY UTILITIES  (unchanged from original)
 # ============================================================================
 
 def compute_entropy(logits: torch.Tensor, temperature: float = 1.0) -> float:
@@ -234,76 +260,34 @@ def adaptive_threshold(
 
 class PagedModelWrapper:
     """
-    Thin wrapper over TransformerForCausalLM that provides:
+    Model-agnostic wrapper that drives the paged KV-cache inference loop.
 
-        prefill(input_ids, seq_id)  → logits
-        decode_batch(token_ids_per_seq, seq_ids) → list[logits]
+    All model-family-specific logic (layer access, QKV projection, RoPE,
+    norm names) is delegated to a ``ModelAdapter`` instance.  The wrapper
+    itself is pure pipeline mechanics: embed → per-layer (norm, attn, mlp,
+    residual) → final-norm → lm_head.
 
-    It reaches inside the model to call ``attn.forward_paged_prefill()``
-    and ``attn.forward_paged_decode()`` on each layer, threading the
-    ``PagedKVCacheManager`` through.  The embedding, MLP, norm, and
-    lm_head layers are called directly.
+    Interface::
 
-    This bypasses the standard ``model.forward()`` / ``FLACache`` path
-    entirely.
+        wrapper = PagedModelWrapper(model, kv_cache_mgr, adapter, eos_token_id=eos)
+        logits           = wrapper.prefill(input_ids, seq_id)
+        logits_list, hs  = wrapper.decode_batch(token_ids, seq_ids)
     """
 
     def __init__(
         self,
         model,
         kv_cache_mgr: PagedKVCacheManager,
+        adapter,                            # ModelAdapter instance
         eos_token_id: int | list[int] = 2,
     ):
         self.model = model
         self.kv_cache_mgr = kv_cache_mgr
+        self.adapter = adapter
         self.eos_token_id = eos_token_id
-        self.device = next(model.parameters()).device
-        self.dtype = next(model.parameters()).dtype
-
-        base = model.model if hasattr(model, 'model') else model
-        _emb_candidates = ['embed_tokens', 'word_embeddings', 'wte', 'embed']
-        try:
-            self.embeddings = next(getattr(base, n) for n in _emb_candidates if hasattr(base, n))
-        except StopIteration:
-            raise AttributeError(
-                f"Could not find an embedding table in {type(base).__name__}. "
-                f"Checked: {_emb_candidates}. Add the correct attribute name to the list."
-            )
-        self.layers = base.layers
-        self.final_norm = base.norm
-        self.lm_head = model.lm_head
+        self.device = adapter.device
+        self.dtype = adapter.dtype
         self.config = model.config
-
-        # --- Duck Type Normalization Layers ---
-        first_block = self.layers[0]
-        # Candidates ordered by frequency across Llama / Mistral / Qwen / Gemma / Falcon / GPT-2.
-        _norm1_candidates = [
-            'input_layernorm',       # Llama, Mistral, Qwen
-            'pre_attention_layernorm',  # Gemma
-            'ln_1',                  # GPT-2 / Falcon
-            'attention_norm',        # some older variants
-        ]
-        _norm2_candidates = [
-            'post_attention_layernorm',     # Llama, Mistral, Qwen
-            'pre_feedforward_layernorm',    # Gemma (pre-MLP norm)
-            'post_feedforward_layernorm',   # Gemma (post-MLP norm — only needed if you expose it)
-            'ln_2',                         # GPT-2 / Falcon
-            'ffn_norm',                     # some older variants
-        ]
-        try:
-            self._norm1_attr = next(n for n in _norm1_candidates if hasattr(first_block, n))
-        except StopIteration:
-            raise AttributeError(
-                f"Could not find a pre-attention norm in {type(first_block).__name__}. "
-                f"Checked: {_norm1_candidates}. Add the correct attribute name to the list."
-            )
-        try:
-            self._norm2_attr = next(n for n in _norm2_candidates if hasattr(first_block, n))
-        except StopIteration:
-            raise AttributeError(
-                f"Could not find a post-attention norm in {type(first_block).__name__}. "
-                f"Checked: {_norm2_candidates}. Add the correct attribute name to the list."
-            )
 
     # ------------------------------------------------------------------
     #  Prefill — single sequence
@@ -326,33 +310,29 @@ class PagedModelWrapper:
         Returns:
             logits: (vocab_size,) — logits for the *last* position.
         """
-        hidden = self.embeddings(input_ids)  # (1, seq_len, D)
+        adapter = self.adapter
+        hidden = adapter.embeddings(input_ids)  # (1, seq_len, D)
 
-        for layer_idx, block in enumerate(self.layers):
-            # -- Attention (paged prefill) --
+        for layer_idx, block in enumerate(adapter.layers):
+            attn = adapter.get_self_attn(block)
+
+            # -- Pre-attention norm + paged prefill attention --
             residual = hidden
-            # REPLACED: attn_input = block.attn_norm(hidden)
-            attn_input = getattr(block, self._norm1_attr)(hidden)
-
-            # REPLACED: block.attn.forward_paged_prefill
-            attn_out, k_new, v_new = block.self_attn.forward_paged_prefill(
-                hidden_states=attn_input,
+            attn_input = adapter.apply_pre_attn_norm(block, hidden)
+            attn_out, k_new, v_new = adapter.forward_paged_prefill(
+                attn, attn_input, layer_idx,
             )
-
             self.kv_cache_mgr.append_tokens(seq_id, layer_idx, k_new, v_new)
+            hidden = adapter.apply_post_attn_residual(block, residual, attn_out)
 
-            # -- Residual + MLP (replicating Qwen3DecoderLayer logic) --
-            hidden = residual + attn_out
+            # -- Pre-MLP norm + MLP --
             residual = hidden
+            mlp_input = adapter.apply_pre_mlp_norm(block, hidden)
+            mlp_out = adapter.get_mlp(block)(mlp_input)
+            hidden = adapter.apply_post_mlp_residual(block, residual, mlp_out)
 
-            # REPLACED: hidden = block.mlp_norm(hidden)
-            hidden = getattr(block, self._norm2_attr)(hidden)
-
-            hidden = block.mlp(hidden)
-            hidden = residual + hidden
-
-        hidden = self.final_norm(hidden)
-        logits = self.lm_head(hidden[0, -1, :])  # (vocab_size,)
+        hidden = adapter.final_norm(hidden)
+        logits = adapter.lm_head(hidden[0, -1, :])  # (vocab_size,)
         return logits
 
     # ------------------------------------------------------------------
@@ -368,47 +348,31 @@ class PagedModelWrapper:
         """
         Decode one token per sequence for a batch of active leaves.
 
-        For each sequence, the new token's KV is appended to the paged
-        cache layer-by-layer, then attention gathers from the full
-        history (including the just-appended token).
-
-        Optimisations over the naive per-layer path:
-          - Append: slot-index GPU tensor is built once and reused
-            across all layers (slots are always layer-invariant).
-            Block allocations, CoW, and counter updates remain per-layer
-            to preserve correctness.
-          - Gather: slot-index tensor, cu_seqlens_k, and seq_lengths
-            are computed once (after layer 0's append) and reused for
-            layers 1..L-1.  Only the per-layer block-index tensor is
-            rebuilt each layer.
-
-        Net savings per step: eliminates (L-1) slot-index tensor
-        allocations for append + (L-1) slot-index, cu_seqlens, and
-        seq_lengths constructions for gather.
+        For each sequence the new token's KV is appended to the paged cache
+        layer-by-layer, then attention gathers from the full history
+        (including the just-appended token).
 
         Args:
             token_ids_per_seq: list of N token ids (one per leaf).
             seq_ids:           list of N paged-cache sequence ids.
 
         Returns:
-            logits_list: List of N logits tensors, each (vocab_size,).
+            logits_list:   List of N logits tensors, each (vocab_size,).
             hidden_states: (N, D) final hidden states before lm_head.
         """
+        adapter = self.adapter
         N = len(seq_ids)
         assert N == len(token_ids_per_seq)
 
         if N == 0:
             D = self.config.hidden_size
-            empty_hidden = torch.empty(
-                0, D, device=self.device, dtype=self.dtype,
-            )
-            return [], empty_hidden
+            return [], torch.empty(0, D, device=self.device, dtype=self.dtype)
 
         # -- Embedding --
         ids = torch.tensor(
             token_ids_per_seq, device=self.device, dtype=torch.long,
         ).unsqueeze(0)  # (1, N)
-        hidden = self.embeddings(ids)  # (1, N, D)
+        hidden = adapter.embeddings(ids)  # (1, N, D)
 
         # Per-sequence RoPE position = number of tokens already cached
         # (this is the position of the NEW token being decoded).
@@ -416,105 +380,44 @@ class PagedModelWrapper:
             self.kv_cache_mgr.get_kv_length(sid) for sid in seq_ids
         ]
 
-        # -- Precompute the shared slot-index tensor for appends --
-        # Slot offsets are identical across all layers because
-        # tokens_in_last_block is always in sync.  Build the GPU
-        # tensor once and reuse it L times.
-        append_slt_indices = (
-            self.kv_cache_mgr.prepare_append_slot_indices(seq_ids)
-        )
-        append_slt_t = torch.tensor(
-            append_slt_indices, device=self.device, dtype=torch.long,
-        )
+        for layer_idx, block in enumerate(adapter.layers):
+            attn = adapter.get_self_attn(block)
 
-        cached_gather_meta = None
-
-        for layer_idx, block in enumerate(self.layers):
             residual = hidden
+            attn_input = adapter.apply_pre_attn_norm(block, hidden)
 
-            attn_input = getattr(block, self._norm1_attr)(hidden)
-
-            # Step 1: Project K/V + RoPE for the new decode tokens.
-            k_new, v_new = self._project_kv(
-                block.self_attn, attn_input, seq_ids, seqlen_offsets,
+            # Step 1: Project K/V + RoPE for the new decode tokens and
+            # append them to the paged cache *before* running attention so
+            # the new token attends to itself.
+            k_new, v_new = adapter.project_kv_for_cache(
+                attn, attn_input, seqlen_offsets,
             )
-
-            # Step 2: Append new K/V into paged cache.
-            # Per-layer bookkeeping (block alloc, CoW, counter updates)
-            # happens inside; only the slot-index tensor is shared.
-            self.kv_cache_mgr.append_tokens_batched_fast(
+            self.kv_cache_mgr.append_tokens_batched(
                 seq_ids=seq_ids,
                 layer_idx=layer_idx,
                 k=k_new,
                 v=v_new,
-                slot_idx_t=append_slt_t,
             )
 
-            # Step 3: After layer 0's append, build the gather metadata
-            # (slot indices, cu_seqlens, seq_lengths) that is shared
-            # across all layers.  Block indices still differ per layer
-            # and are built inside build_packed_kv.
-            if layer_idx == 0:
-                cached_gather_meta = (
-                    self.kv_cache_mgr.prepare_gather_metadata(seq_ids)
-                )
-
-            # Step 4: Run Q-only attention reading from paged cache
-            attn_out = block.self_attn.forward_paged_decode(
-                hidden_states=attn_input,
-                kv_cache_mgr=self.kv_cache_mgr,
-                seq_ids=seq_ids,
-                seqlen_offsets=seqlen_offsets,
-                cached_gather_indices=cached_gather_meta,
+            # Step 2: Q-only projection + varlen flash attention over cache.
+            attn_out = adapter.forward_paged_decode(
+                attn, attn_input, self.kv_cache_mgr,
+                seq_ids, seqlen_offsets, layer_idx,
             )
 
-            # -- Residual + MLP --
-            hidden = residual + attn_out
+            hidden = adapter.apply_post_attn_residual(block, residual, attn_out)
+
+            # -- MLP --
             residual = hidden
+            mlp_input = adapter.apply_pre_mlp_norm(block, hidden)
+            mlp_out = adapter.get_mlp(block)(mlp_input)
+            hidden = adapter.apply_post_mlp_residual(block, residual, mlp_out)
 
-            hidden = getattr(block, self._norm2_attr)(hidden)
-
-            hidden = block.mlp(hidden)
-            hidden = residual + hidden
-
-        hidden = self.final_norm(hidden)
-        # hidden: (1, N, D) → hidden_flat: (N, D)
-        hidden_flat = hidden.squeeze(0)
-        # logits: (N, vocab_size)
-        all_logits = self.lm_head(hidden_flat)
+        hidden = adapter.final_norm(hidden)
+        hidden_flat = hidden.squeeze(0)         # (N, D)
+        all_logits = adapter.lm_head(hidden_flat)  # (N, vocab_size)
 
         return [all_logits[i] for i in range(N)], hidden_flat
-
-    # ------------------------------------------------------------------
-    #  Internal: lightweight K/V projection + RoPE (no attention)
-    # ------------------------------------------------------------------
-
-    def _project_kv(
-        self,
-        attn_module,
-        hidden_states: torch.Tensor,
-        seq_ids: list[int],
-        seqlen_offsets: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute post-RoPE K and V for the new decode tokens without
-        running the full attention computation.
-
-        This avoids double-projecting: we project K/V here, append to
-        the cache, then ``forward_paged_decode`` only needs to project
-        Q and gather the full KV from the cache.
-
-        Args:
-            attn_module: the PagedAttention nn.Module for this layer.
-            hidden_states: (1, N, D) — normed hidden states.
-            seq_ids: list of N seq_ids.
-            seqlen_offsets: list of N position offsets.
-
-        Returns:
-            k: (N, num_key_value_heads, head_dim) — post-RoPE K.
-            v: (N, num_key_value_heads, head_dim) — V (no RoPE applied).
-        """
-        return attn_module.project_kv_paged(hidden_states, seqlen_offsets)
 
     # ------------------------------------------------------------------
     def is_eos(self, token_id: int) -> bool:

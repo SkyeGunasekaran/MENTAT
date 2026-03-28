@@ -8,12 +8,12 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 # ---------------------------------------------------------------------------
-# 1. Import the model adapter system
+# 1. Import the adapter factory (auto-detects model family at runtime)
 # ---------------------------------------------------------------------------
-from model_adapter import get_adapter
+from adapters.adapter_factory import get_adapter, register_adapter
 
 # ---------------------------------------------------------------------------
 # 2. Import the paged UQ generator
@@ -30,6 +30,7 @@ DEFAULT_PROMPTS = [
     "Once upon a time, in a kingdom far away,",
     "The key difference between classical and quantum computing is",
 ]
+
 
 # ---------------------------------------------------------------------------
 # 4. Pretty-printing helpers
@@ -149,7 +150,8 @@ def serialize_results(
             'kv_blocks_peak': diagnostics['kv_blocks_peak'],
             'kv_blocks_total': diagnostics['kv_blocks_total'],
             'kv_peak_utilization': diagnostics['kv_peak_utilization'],
-            # branch evolution
+            # branch evolution: list of length == decode steps taken;
+            # active_branch_trace[i] = number of live branches at step i.
             'active_branch_trace': diagnostics.get('active_branch_trace', []),
         },
         'diagnostics': {
@@ -175,6 +177,7 @@ def serialize_results(
             ],
         },
     }
+
 
 # ---------------------------------------------------------------------------
 # 6. Main
@@ -209,6 +212,7 @@ def main():
 
     # Semantic diversity pruning
     parser.add_argument("--sim_threshold", type=float, default=0.90)
+    parser.add_argument("--ema_alpha", type=float, default=0.2)
 
     # Exploration window
     parser.add_argument("--exploration_window", type=int, default=15)
@@ -252,7 +256,6 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # We now load standard HF models directly without custom AutoModel registrations
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
@@ -264,11 +267,6 @@ def main():
     print(f"  Vocab size:  {model.config.vocab_size}")
     print(f"  Layers:      {model.config.num_hidden_layers}")
     print(f"  Hidden:      {model.config.hidden_size}")
-
-    # ---- CREATE MODEL ADAPTER ----
-    print("  Creating model adapter...")
-    adapter = get_adapter(model)
-    print(f"  Adapter: {type(adapter).__name__}")
 
     # ---- UQ parameters summary ----
     print_header("UQ Configuration (Paged Batched)")
@@ -282,6 +280,7 @@ def main():
     print(f"  freq_penalty:      {args.freq_penalty}")
     print(f"  ngram_block:       {args.ngram_block}")
     print(f"  sim_threshold:     {args.sim_threshold}")
+    print(f"  ema_alpha:         {args.ema_alpha}")
     print(f"  explore_window:    {args.exploration_window}")
     print(f"  explore_pctile:    {args.exploration_percentile}")
     print(f"  block_size:        {args.block_size}")
@@ -295,12 +294,10 @@ def main():
         print_header(f"Generating [{i+1}/{len(prompts)}]")
         print(f'  Prompt: "{prompt}"')
 
-        # Notice how we just pass the standard model, but under the hood, 
-        # the generator will now be calling the newly injected paged methods!
         gen = PagedPrefixTreeUQGenerator(
-            model=model,
-            tokenizer=tokenizer,
-            adapter=adapter,
+            model,
+            tokenizer,
+            adapter=get_adapter(model),
             max_active_branches=args.max_active,
             branching_factor=args.branching_factor,
             relative_entropy_multiplier=args.relative_entropy_multiplier,
@@ -313,6 +310,7 @@ def main():
             block_size=args.block_size,
             max_blocks=args.max_blocks,
             semantic_similarity_threshold=args.sim_threshold,
+            ema_alpha=args.ema_alpha,
             exploration_window=args.exploration_window,
             exploration_percentile=args.exploration_percentile,
         )
@@ -361,6 +359,7 @@ def main():
                 'freq_penalty': args.freq_penalty,
                 'ngram_block': args.ngram_block,
                 'sim_threshold': args.sim_threshold,
+                'ema_alpha': args.ema_alpha,
                 'exploration_window': args.exploration_window,
                 'exploration_percentile': args.exploration_percentile,
                 'block_size': args.block_size,
