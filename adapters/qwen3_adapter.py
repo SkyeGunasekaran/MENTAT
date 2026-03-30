@@ -80,10 +80,16 @@ class Qwen3Adapter(ModelAdapter):
         layout does not affect the numerical result).
         """
         head_dim = self.head_dim
+        
         # Project and reshape to (batch, seq, heads, head_dim) — FA layout.
-        q = rearrange(attn.q_proj(hidden_states), "b s (h d) -> b s h d", d=head_dim)
-        k = rearrange(attn.k_proj(hidden_states), "b s (h d) -> b s h d", d=head_dim)
-        v = rearrange(attn.v_proj(hidden_states), "b s (h d) -> b s h d", d=head_dim)
+        # Extract batch and sequence length dynamically from the input tensor
+        b, s, _ = hidden_states.shape
+
+        # Project and reshape to (batch, seq, heads, head_dim) — FA layout.
+        # Using -1 automatically infers the number of heads (h) based on head_dim.
+        q = attn.q_proj(hidden_states).view(b, s, -1, head_dim)
+        k = attn.k_proj(hidden_states).view(b, s, -1, head_dim)
+        v = attn.v_proj(hidden_states).view(b, s, -1, head_dim)
         # QK-norm is unconditional on Qwen3 (always present).
         q = attn.q_norm(q)
         k = attn.k_norm(k)

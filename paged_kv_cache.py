@@ -294,21 +294,6 @@ class PagedKVCacheManager:
         """
         Gather K and V for all sequences into a single packed (varlen) tensor.
 
-        Previous implementation issued one GPU copy per block per sequence in a
-        Python loop — O(N × blocks_per_seq) kernel launches per layer per step.
-
-        This implementation:
-          1. Walks the page tables in Python to build two flat integer lists:
-             ``block_indices`` and ``slot_indices``, each of length
-             ``total_tokens``.  This is pure CPU integer arithmetic on small
-             lists and is negligible.
-          2. Issues a single advanced-index gather on each pool tensor:
-               pool[block_indices, slot_indices]   →  (total_tokens, H, D)
-             This is one GPU kernel regardless of N, sequence length, or
-             branching depth.
-          3. Builds ``cu_seqlens_k`` from the sequence lengths, which are
-             already tracked in Python state — no GPU reduction needed.
-
         Returns:
             packed_k:    (total_tokens, num_kv_heads, head_dim)
             packed_v:    (total_tokens, num_kv_heads, head_dim)
@@ -358,8 +343,8 @@ class PagedKVCacheManager:
 
         # --- 3. Single GPU gather (one kernel each for K and V) ---
         # Upload index tensors once; they are small (total_tokens ints).
-        blk_t = torch.tensor(block_indices, device=self.device, dtype=torch.long)
-        slt_t = torch.tensor(slot_indices,  device=self.device, dtype=torch.long)
+        blk_t = torch.tensor(block_indices, dtype=torch.long).pin_memory().to(self.device, non_blocking=True)
+        slt_t = torch.tensor(slot_indices, dtype=torch.long).pin_memory().to(self.device, non_blocking=True)
 
         # pool shape: (max_blocks, block_size, num_kv_heads, head_dim)
         # Result:     (total_tokens, num_kv_heads, head_dim)
@@ -369,10 +354,8 @@ class PagedKVCacheManager:
         # --- 4. cu_seqlens_k — cumulative sum of Python ints, pinned transfer ---
         # torch.tensor() on a tiny CPU list + .to(device) is faster than
         # computing cumsum on GPU for the small N typical here.
-        cu_cpu = torch.zeros(len(seq_ids) + 1, dtype=torch.int32)
-        for i, l in enumerate(seq_lengths):
-            cu_cpu[i + 1] = cu_cpu[i] + l
-        cu_seqlens_k = cu_cpu.to(self.device, non_blocking=True)
+        cu_cpu = torch.tensor([0] + seq_lengths, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens_k = cu_cpu.pin_memory().to(self.device, non_blocking=True)
 
         return packed_k, packed_v, cu_seqlens_k, max_seqlen_k
 
