@@ -48,9 +48,10 @@ class PagedPrefixTreeUQGenerator:
         # Semantic diversity pruning
         semantic_similarity_threshold: float = 0.95,
         ema_alpha: float = 0.3,
-        # Exploration window
-        exploration_window: int = 10,
-        exploration_percentile: float = 0.99,
+        min_steps_before_prune: int = 3,
+        # Soft exploration warmup
+        soft_explore_window: int = 10,
+        soft_explore_initial: float = 0.5,
     ):
         eos = tokenizer.eos_token_id
         if eos is None:
@@ -68,8 +69,9 @@ class PagedPrefixTreeUQGenerator:
         self.max_ngram_block = max_ngram_block
         self.semantic_similarity_threshold = semantic_similarity_threshold
         self.ema_alpha = ema_alpha
-        self.exploration_window = exploration_window
-        self.exploration_percentile = exploration_percentile
+        self.min_steps_before_prune = min_steps_before_prune
+        self.soft_explore_window = soft_explore_window
+        self.soft_explore_initial = soft_explore_initial
 
         # Resolve adapter — auto-detect if not supplied.
         if adapter is None:
@@ -112,7 +114,6 @@ class PagedPrefixTreeUQGenerator:
         self.pruning_events: list[tuple[int, int]] = []
         self.entropy_trace: list[tuple[int, int, float]] = []
         self.diversity_pruning_events: list[tuple[int, int]] = []  # (step, count)
-        self.exploration_branches_created: int = 0
 
         # Performance / throughput metrics (populated during generate())
         self.active_branch_trace: list[int] = []   # active branches at each decode step
@@ -171,12 +172,7 @@ class PagedPrefixTreeUQGenerator:
         )
         tree.root.children[0] = first_leaf
 
-        # Handle first decode step from prefill logits
-        # (No hidden state from prefill — semantic vector stays None
-        #  until the first real decode step produces one.)
-        # Step 0 is always in exploration phase.
-        self.active_branch_trace.append(1)  # step 0: one active branch
-        self._step_leaf_explore(tree, first_leaf, logits, step=0, num_active=1)
+        self._step_leaf(tree, first_leaf, logits, step=0, num_active=1)
 
         # ---- Main decode loop ----
         _t0_decode = time.perf_counter()
@@ -187,7 +183,6 @@ class PagedPrefixTreeUQGenerator:
 
             num_active = len(active)
             self.active_branch_trace.append(num_active)
-            in_exploration = step < self.exploration_window
 
             # -- Batched forward pass for all active leaves --
             token_ids_batch = [leaf.token_ids[-1] for leaf in active]
@@ -199,29 +194,18 @@ class PagedPrefixTreeUQGenerator:
             # Each forward pass decodes one token per active sequence.
             self._total_tokens_decoded += num_active
 
-            # -- Update semantic vectors via EMA (always, even during
-            #    exploration — we want the vectors warm when pruning
-            #    activates) --
+            # -- Update semantic vectors via EMA --
             self._update_semantic_vectors(active, hidden_states)
 
-            # -- Per-leaf branch/extend decisions --
-            if in_exploration:
-                for leaf, leaf_logits in zip(list(active), logits_list):
-                    if not leaf.is_active:
-                        continue
-                    self._step_leaf_explore(
-                        tree, leaf, leaf_logits, step, num_active,
-                    )
-            else:
-                for leaf, leaf_logits in zip(list(active), logits_list):
-                    if not leaf.is_active:
-                        continue
-                    self._step_leaf(tree, leaf, leaf_logits, step, num_active)
-
+            # -- Per-leaf branch/extend decisions (unified path with
+            #    soft-exploration warmup baked into the threshold) --
+            for leaf, leaf_logits in zip(list(active), logits_list):
+                if not leaf.is_active:
+                    continue
+                self._step_leaf(tree, leaf, leaf_logits, step, num_active)
 
             # -- Semantic diversity prune  --
-            if not in_exploration:
-                self._prune_similar(tree, step)
+            self._prune_similar(tree, step)
 
             # -- Early stop --
             if not tree.get_active_leaves():
@@ -261,6 +245,8 @@ class PagedPrefixTreeUQGenerator:
 
         # Sort using the newly calculated normalized probability
         results.sort(key=lambda r: r['norm_prob'], reverse=True)
+
+        self.tree = tree
         return results
 
     # ------------------------------------------------------------------
@@ -288,112 +274,8 @@ class PagedPrefixTreeUQGenerator:
             self._free_walk(child)
 
     # ------------------------------------------------------------------
-    #  Exploration phase: fan-out on high-percentile tokens
+    #  Branching helpers
     # ------------------------------------------------------------------
-
-    def _step_leaf_explore(
-        self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-        step: int,
-        num_active: int,
-    ):
-        """
-        Exploration-phase step: force-branch on all tokens above the
-        configured percentile, up to a hard per-leaf cap of K and
-        global max_active headroom.
-
-        If only one token qualifies (or no headroom), falls back to
-        greedy extend.
-        """
-        entropy = compute_entropy(logits, self.temperature)
-        self.entropy_trace.append((step, leaf.node_id, entropy))
-
-        # NEW: Update the running EMA for this specific sequence
-        if leaf.entropy_ema is None:
-            leaf.entropy_ema = entropy
-        else:
-            leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
-
-        # NEW: Calculate the dynamic threshold
-        # We scale the relative multiplier by tree utilization to preserve your memory safety mechanism
-        util = num_active / max(self.M, 1)
-        dynamic_multiplier = self.relative_entropy_multiplier * (1.0 + 2.0 * util * util)
-        
-        tau = leaf.entropy_ema * dynamic_multiplier
-
-        seq_so_far = leaf.get_full_sequence()
-
-        penalized = apply_repetition_penalty(
-            logits, seq_so_far,
-            penalty=self.rep_penalty,
-            frequency_penalty=self.freq_penalty,
-            max_ngram_block=self.max_ngram_block,
-        )
-
-        headroom = self.M - num_active
-
-        if headroom >= 2:
-            self._do_branch_explore(tree, leaf, penalized, step, headroom)
-        else:
-            self._do_extend(tree, leaf, penalized)
-
-    def _do_branch_explore(
-        self,
-        tree: PrefixTree,
-        leaf: TreeNode,
-        logits: torch.Tensor,
-        step: int,
-        headroom: int,
-    ):
-        """
-        Exploration branch: select all tokens whose probability is
-        above the p-th percentile of the distribution, capped at
-        min(K, headroom) branches.
-        """
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = torch.exp(log_probs)
-
-        # Percentile threshold — computed on GPU via quantile
-        threshold = torch.quantile(probs.float(), self.exploration_percentile)
-
-        # Mask: tokens above the percentile
-        above_mask = probs >= threshold
-        candidate_indices = above_mask.nonzero(as_tuple=False).squeeze(-1)
-
-        # Cap at min(K, headroom)
-        max_branches = min(self.K, headroom)
-
-        if candidate_indices.numel() <= 1:
-            # Only one token above percentile — just extend
-            best_id = torch.argmax(log_probs).item()
-            best_lp = log_probs[best_id].item()
-            tree.extend_leaf(leaf, best_id, best_lp)
-            
-            # FIX: Replaced manual block with _handle_eos
-            self._handle_eos(tree, leaf) 
-            return
-
-        # If more candidates than our cap, take the top-K by log-prob
-        if candidate_indices.numel() > max_branches:
-            candidate_lps = log_probs[candidate_indices]
-            _, top_idx = torch.topk(candidate_lps, max_branches)
-            candidate_indices = candidate_indices[top_idx]
-
-        # Extract token ids and log-probs (small tensor → CPU)
-        token_ids = candidate_indices.tolist()
-        token_lps = log_probs[candidate_indices].tolist()
-
-        children = tree.branch_leaf(leaf, token_ids, token_lps)
-        self.branch_points.append(
-            (step, compute_entropy(logits), len(children))
-        )
-
-        for child in children: 
-            child.creation_step = step
-            self._handle_eos(tree, child)
-
 
     def _do_branch(
         self,
@@ -416,9 +298,8 @@ class PagedPrefixTreeUQGenerator:
             (step, compute_entropy(logits), len(children))
         )
 
-        # FIX: Removed manual semantic_vector cloning here to match _do_branch_explore
-        # (Assuming PrefixTree.branch_leaf handles it now)
         for child in children: 
+            child.creation_step = step
             self._handle_eos(tree, child)
 
 
@@ -437,8 +318,22 @@ class PagedPrefixTreeUQGenerator:
 
         self._handle_eos(tree, leaf)
     # ------------------------------------------------------------------
-    #  Convergence phase: entropy-gated branching (original logic)
+    #  Entropy-gated branching with soft-exploration warmup
     # ------------------------------------------------------------------
+
+    def _soft_explore_factor(self, step: int) -> float:
+        """
+        Returns a multiplier in [soft_explore_initial, 1.0] that linearly
+        ramps from a permissive value to 1.0 over ``soft_explore_window``
+        steps.  During early steps the effective threshold is lower,
+        making branching easier (soft exploration) without the memory
+        explosion of unconditional fan-out.
+        """
+        if step >= self.soft_explore_window:
+            return 1.0
+        # Linear ramp: initial → 1.0
+        t = step / max(self.soft_explore_window, 1)
+        return self.soft_explore_initial + (1.0 - self.soft_explore_initial) * t
 
     def _step_leaf(
         self,
@@ -460,16 +355,19 @@ class PagedPrefixTreeUQGenerator:
 
         # Calculate the dynamic multiplier based on tree capacity
         dynamic_multiplier = adaptive_threshold(self.relative_entropy_multiplier, self.M, num_active)
+
+        # Apply soft-exploration warmup: early steps scale the threshold
+        # down so branching is easier (more permissive), then ramp to
+        # full strictness over soft_explore_window steps.
+        warmup = self._soft_explore_factor(step)
         
-        # The new threshold is the baseline multiplied by the dynamic multiplier
-        tau = leaf.entropy_ema * dynamic_multiplier
+        # The threshold is EMA × capacity multiplier × warmup factor
+        tau = leaf.entropy_ema * dynamic_multiplier * warmup
 
         seq_so_far = leaf.get_full_sequence()
         penalized = apply_repetition_penalty(
             logits, seq_so_far,
-            penalty=self.rep_penalty,
-            frequency_penalty=self.freq_penalty,
-            max_ngram_block=self.max_ngram_block,
+            penalty=self.rep_penalty
         )
 
         headroom = self.M - num_active
@@ -512,18 +410,30 @@ class PagedPrefixTreeUQGenerator:
         computes the full (N, N) cosine similarity on GPU in one
         batched operation, and prunes the lower-probability branch
         from any pair exceeding the similarity threshold.
+
+        Guards:
+          1. A leaf must have lived for at least ``min_steps_before_prune``
+             decode steps so its EMA semantic vector has diverged from the
+             parent's cloned vector.  With ema_alpha=0.3, after 3 steps the
+             parent contribution is 0.7^3 ≈ 34 % — enough for siblings to
+             have differentiated.
+          2. Two siblings that share the same parent (i.e. were born from
+             the same branch point) are never compared against each other,
+             because their vectors start identical and need extra time to
+             diverge.
         """
         leaves = tree.get_active_leaves()
         N = len(leaves)
         if N <= 1:
             return
  
-        # Filter to leaves that have a semantic vector (skip any
-        # that haven't been through a decode step yet).
+        # Filter to leaves whose EMA has had enough steps to warm up.
+        min_age = self.min_steps_before_prune
         sv_leaves: list[TreeNode] = []
         sv_list: list[torch.Tensor] = []
         for leaf in leaves:
-            if leaf.semantic_vector is not None and leaf.creation_step < step: # FIX IS HERE
+            age = step - leaf.creation_step
+            if leaf.semantic_vector is not None and age >= min_age:
                 sv_leaves.append(leaf)
                 sv_list.append(leaf.semantic_vector)
  
@@ -542,6 +452,15 @@ class PagedPrefixTreeUQGenerator:
         # Mask the diagonal and lower triangle so each pair is only
         # considered once (and a leaf is never compared to itself).
         mask = torch.triu(torch.ones(M, M, device=sim_matrix.device, dtype=torch.bool), diagonal=1)
+
+        # Also mask out sibling pairs (same parent) — their vectors
+        # were cloned from the same source and need extra time to diverge.
+        for i in range(M):
+            for j in range(i + 1, M):
+                if (sv_leaves[i].parent is not None
+                        and sv_leaves[i].parent is sv_leaves[j].parent):
+                    mask[i, j] = False
+
         sim_matrix = sim_matrix * mask
  
         # Find pairs above threshold — GPU comparison, then a small
@@ -587,16 +506,6 @@ class PagedPrefixTreeUQGenerator:
     # ------------------------------------------------------------------
 
     def get_diagnostics(self) -> dict:
-        # Count exploration-phase branch points (steps < exploration_window)
-        exploration_bp = [
-            (s, e, k) for s, e, k in self.branch_points
-            if s < self.exploration_window
-        ]
-        convergence_bp = [
-            (s, e, k) for s, e, k in self.branch_points
-            if s >= self.exploration_window
-        ]
-
         # ---- Throughput ----
         # decode_tps: tokens emitted per wall-second during the decode loop.
         # Each forward pass emits one token per active branch, so this is the
@@ -614,10 +523,8 @@ class PagedPrefixTreeUQGenerator:
         kv_stats = self.kv_cache_mgr.get_stats()
 
         return {
-            # --- branch / prune diagnostics (unchanged) ---
+            # --- branch / prune diagnostics ---
             'num_branch_points': len(self.branch_points),
-            'exploration_branch_points': len(exploration_bp),
-            'convergence_branch_points': len(convergence_bp),
             'total_pruned': sum(n for _, n in self.pruning_events),
             'total_diversity_pruned': sum(n for _, n in self.diversity_pruning_events),
             'branch_points': self.branch_points,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-
+from visualize_tree import export_tree_visualization
 # ---------------------------------------------------------------------------
 # 1. Import the adapter factory (auto-detects model family at runtime)
 # ---------------------------------------------------------------------------
@@ -47,9 +47,7 @@ def print_results_for_prompt(prompt: str, results: list[dict], diagnostics: dict
 
     n_branch = diagnostics['num_branch_points']
     n_div_pruned = diagnostics.get('total_diversity_pruned', 0)
-    n_explore_bp = diagnostics.get('exploration_branch_points', 0)
-    n_converge_bp = diagnostics.get('convergence_branch_points', 0)
-    print(f"  Branch points: {n_branch} (explore: {n_explore_bp}, converge: {n_converge_bp})")
+    print(f"  Branch points: {n_branch}")
     print(f"  Pruned: {n_div_pruned}")
     print(f"  Sequences returned: {len(results)}")
 
@@ -95,10 +93,9 @@ def print_results_for_prompt(prompt: str, results: list[dict], diagnostics: dict
 
     for i, res in enumerate(results):
         tag = "COMPLETE" if res.get('complete', True) else "PARTIAL"
-        pct = res['norm_prob'] * 100
         
         # Update the print statement to show the percentage
-        print(f"\n  [{i+1}] ({tag})  prob={pct:.2f}%  (log_prob={res['log_prob']:.3f})")
+        print(f"\n  [{i+1}] ({tag})  log_prob={res['log_prob']:.3f}")
         text = res['text']
         print(f"      {text}")
     print()
@@ -128,8 +125,6 @@ def serialize_results(
                 'text': r['text'],
                 'log_prob': safe_float(r['log_prob']),
                 'avg_log_prob': r['log_prob'] / max(len(r['token_ids']), 1),
-                'normalized_prob': safe_float(r['norm_prob']), # Save to JSON
-                'normalized_prob_pct': safe_float(r['norm_prob'] * 100), # Optional: save as strict %
                 'num_tokens': len(r['token_ids']),
             }
             for r in results
@@ -156,8 +151,6 @@ def serialize_results(
         },
         'diagnostics': {
             'num_branch_points': diagnostics['num_branch_points'],
-            'exploration_branch_points': diagnostics.get('exploration_branch_points', 0),
-            'convergence_branch_points': diagnostics.get('convergence_branch_points', 0),
             'total_diversity_pruned': diagnostics.get('total_diversity_pruned', 0),
             'branch_points': [
                 {'step': s, 'entropy': safe_float(e), 'num_children': k}
@@ -199,24 +192,24 @@ def main():
 
     # UQ parameters
     parser.add_argument("--max_new_tokens", type=int, default=256)
-    parser.add_argument("--max_active", type=int, default=25)
-    parser.add_argument("--branching_factor", type=int, default=3)
+    parser.add_argument("--max_active", type=int, default=10)
+    parser.add_argument("--branching_factor", type=int, default=2)
     parser.add_argument("--entropy_ema_alpha", type=float, default=0.2)
-    parser.add_argument("--relative_entropy_multiplier", type=float, default=1.25)
+    parser.add_argument("--relative_entropy_multiplier", type=float, default=1.15)
     parser.add_argument("--temperature", type=float, default=0.7)
 
     # Repetition penalty
     parser.add_argument("--rep_penalty", type=float, default=1.2)
-    parser.add_argument("--freq_penalty", type=float, default=0.3)
-    parser.add_argument("--ngram_block", type=int, default=3)
 
     # Semantic diversity pruning
-    parser.add_argument("--sim_threshold", type=float, default=0.90)
-    parser.add_argument("--ema_alpha", type=float, default=0.2)
+    parser.add_argument("--sim_threshold", type=float, default=0.75)
+    parser.add_argument("--ema_alpha", type=float, default=0.25)
 
-    # Exploration window
-    parser.add_argument("--exploration_window", type=int, default=15)
-    parser.add_argument("--exploration_percentile", type=float, default=0.99)
+    # Soft exploration warmup
+    parser.add_argument("--soft_explore_window", type=int, default=15,
+                        help="Steps over which threshold ramps from permissive to strict")
+    parser.add_argument("--soft_explore_initial", type=float, default=0.3,
+                        help="Initial threshold scale factor (0..1, lower = more permissive)")
 
     # Paged cache config
     parser.add_argument("--block_size", type=int, default=16,
@@ -277,12 +270,10 @@ def main():
     print(f"  entropy_ema_alpha: {args.entropy_ema_alpha}")
     print(f"  temperature:       {args.temperature}")
     print(f"  rep_penalty:       {args.rep_penalty}")
-    print(f"  freq_penalty:      {args.freq_penalty}")
-    print(f"  ngram_block:       {args.ngram_block}")
     print(f"  sim_threshold:     {args.sim_threshold}")
     print(f"  ema_alpha:         {args.ema_alpha}")
-    print(f"  explore_window:    {args.exploration_window}")
-    print(f"  explore_pctile:    {args.exploration_percentile}")
+    print(f"  soft_explore_window: {args.soft_explore_window}")
+    print(f"  soft_explore_initial:{args.soft_explore_initial}")
     print(f"  block_size:        {args.block_size}")
     print(f"  max_blocks:        {args.max_blocks or 'auto'}")
     print(f"  num_prompts:       {len(prompts)}")
@@ -305,14 +296,12 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             repetition_penalty=args.rep_penalty,
-            frequency_penalty=args.freq_penalty,
-            max_ngram_block=args.ngram_block,
             block_size=args.block_size,
             max_blocks=args.max_blocks,
             semantic_similarity_threshold=args.sim_threshold,
             ema_alpha=args.ema_alpha,
-            exploration_window=args.exploration_window,
-            exploration_percentile=args.exploration_percentile,
+            soft_explore_window=args.soft_explore_window,
+            soft_explore_initial=args.soft_explore_initial,
         )
 
         t0 = time.time()
@@ -320,6 +309,10 @@ def main():
         elapsed = time.time() - t0
 
         diag = gen.get_diagnostics()
+
+        # Export the PyVis interactive graph
+        safe_prompt_name = f"tree_prompt_{i}.html"
+        export_tree_visualization(gen.tree, tokenizer, output_path=safe_prompt_name)
 
         # Print paged cache stats
         stats = gen.kv_cache_mgr.get_stats()
@@ -356,12 +349,10 @@ def main():
                 'relative_entropy_multiplier': args.relative_entropy_multiplier,
                 'temperature': args.temperature,
                 'rep_penalty': args.rep_penalty,
-                'freq_penalty': args.freq_penalty,
-                'ngram_block': args.ngram_block,
                 'sim_threshold': args.sim_threshold,
                 'ema_alpha': args.ema_alpha,
-                'exploration_window': args.exploration_window,
-                'exploration_percentile': args.exploration_percentile,
+                'soft_explore_window': args.soft_explore_window,
+                'soft_explore_initial': args.soft_explore_initial,
                 'block_size': args.block_size,
                 'max_blocks': args.max_blocks,
                 'backend': 'paged_batched',
@@ -388,7 +379,6 @@ def main():
         print(f"  Aggregate prefill throughput: "
               f"{total_prefill_tokens / total_prefill_time:.1f} tok/s "
               f"({total_prefill_tokens} tokens in {total_prefill_time:.2f}s)")
-
-
+        
 if __name__ == '__main__':
     main()

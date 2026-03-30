@@ -55,6 +55,7 @@ class TreeNode:
     semantic_vector: Optional[torch.Tensor] = None  
     entropy_ema: Optional[float] = None             # NEW: Track local entropy baseline
     creation_step: int = 0
+    is_pruned: bool = False
 
     def get_full_sequence(self) -> list[int]:
         """Collect all generated token ids from root to this node."""
@@ -122,7 +123,8 @@ class PrefixTree:
                 cumulative_log_prob=leaf.cumulative_log_prob + lp,
                 depth=leaf.depth + 1,
                 is_active=True,
-                entropy_ema=leaf.entropy_ema
+                entropy_ema=leaf.entropy_ema,
+                semantic_vector=leaf.semantic_vector.clone() if leaf.semantic_vector is not None else None
             )
             leaf.children[child.node_id] = child
             children.append(child)
@@ -137,22 +139,34 @@ class PrefixTree:
 
     # ---- prune ------------------------------------------------------------
     def prune_branch(self, node: TreeNode):
-        """Remove *node*, free its paged cache, cascade up if needed."""
+        """
+        Deactivate *node*, free its paged cache, and cascade upward.
+
+        Nodes are marked ``is_pruned = True`` but **kept in the tree** so
+        the visualisation can render them (red for directly-pruned leaves,
+        orange for cascade-pruned internal nodes).
+
+        Cascade rule: after marking *node*, check its parent.  If the
+        parent has no surviving (non-pruned) children and is itself
+        inactive (i.e. it was already branched, not currently generating),
+        mark the parent as pruned too and recurse upward.  The root node
+        is never pruned.
+        """
         if node.seq_id is not None:
             self.kv_cache_mgr.free_sequence(node.seq_id)
             node.seq_id = None
         node.is_active = False
+        node.is_pruned = True
 
+        # Cascade upward through dead internal ancestors
         if node.parent is not None:
             parent = node.parent
-            parent.children = {
-                k: v for k, v in parent.children.items()
-                if v.node_id != node.node_id
-            }
-            if (not parent.children and not parent.is_active
+            has_surviving_child = any(
+                not child.is_pruned for child in parent.children.values()
+            )
+            if (not has_surviving_child and not parent.is_active
                     and parent.parent is not None):
                 self.prune_branch(parent)
-
     # ---- queries ----------------------------------------------------------
     def get_active_leaves(self) -> list[TreeNode]:
         leaves: list[TreeNode] = []
@@ -192,42 +206,26 @@ def apply_repetition_penalty(
     logits: torch.Tensor,
     token_ids: list[int],
     penalty: float = 1.2,
-    frequency_penalty: float = 0.3,
-    max_ngram_block: int = 3,
 ) -> torch.Tensor:
     """Apply repetition suppression to raw logits."""
-    if not token_ids:
+    # Fast exit if there are no tokens or the penalty is exactly 1.0
+    if not token_ids or penalty == 1.0:
         return logits
 
     logits = logits.clone()
 
-    if penalty != 1.0 or frequency_penalty > 0:
-        counts: dict[int, int] = {}
-        for tid in token_ids:
-            counts[tid] = counts.get(tid, 0) + 1
+    # Standard repetition penalty 
+    unique_tokens = list(set(token_ids))
+    gathered = logits[unique_tokens]
 
-        token_indices = list(counts.keys())
-        token_counts = torch.tensor(
-            [counts[t] for t in token_indices],
-            device=logits.device, dtype=logits.dtype,
-        )
-        gathered = logits[token_indices]
+    # Apply the multiplicative penalty
+    gathered = torch.where(
+        gathered > 0,
+        gathered / penalty,
+        gathered * penalty,
+    )
 
-        if penalty != 1.0:
-            gathered = torch.where(
-                gathered > 0,
-                gathered / penalty,
-                gathered * penalty,
-            )
-        if frequency_penalty > 0:
-            gathered = gathered - frequency_penalty * token_counts
-
-        logits[token_indices] = gathered
-
-    if max_ngram_block >= 2 and len(token_ids) >= max_ngram_block:
-        blocked = _find_blocked_tokens(token_ids, max_ngram_block)
-        if blocked:
-            logits[list(blocked)] = float('-inf')
+    logits[unique_tokens] = gathered
 
     return logits
 
