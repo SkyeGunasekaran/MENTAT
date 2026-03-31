@@ -1,10 +1,7 @@
 import torch
 from einops import rearrange
 
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-except ImportError:
-    "Flash attention not found! Please install with `pip install flash_attn --no-build-isolation`!"
+from adapters.attention_backend import attn_prefill, attn_decode
 
 from adapters.model_adapter import ModelAdapter
 
@@ -142,8 +139,8 @@ class LlamaAdapter(ModelAdapter):
 
         # Llama has no sliding window, so window_size is always None here,
         # but we honour the parameter for forward-compatibility.
-        window = (-1, -1) if window_size is None else (window_size - 1, 0)
-        o = flash_attn_func(q, k, v, causal=True, window_size=window)
+        window = None if window_size is None else window_size
+        o = attn_prefill(q, k, v, window_size=window)
 
         k_new = k[0]   # (seq_len, num_kv_heads, head_dim)
         v_new = v[0]
@@ -203,14 +200,13 @@ class LlamaAdapter(ModelAdapter):
 
         cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
 
-        o = flash_attn_varlen_func(
+        o = attn_decode(
             q_flat, packed_k, packed_v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
-            causal=True,
-            window_size=(-1, -1),
+            N=N,
+            window_size=None,
         )
         # o: (N, num_heads, head_dim)
         o = o.unsqueeze(0).reshape(1, total_q, -1)

@@ -341,21 +341,29 @@ class PagedKVCacheManager:
             )
             return empty, empty, cu, 0
 
-        # --- 3. Single GPU gather (one kernel each for K and V) ---
+        # --- 3. Single gather (one kernel each for K and V) ---
         # Upload index tensors once; they are small (total_tokens ints).
-        blk_t = torch.tensor(block_indices, dtype=torch.long).pin_memory().to(self.device, non_blocking=True)
-        slt_t = torch.tensor(slot_indices, dtype=torch.long).pin_memory().to(self.device, non_blocking=True)
+        # pin_memory() is only available when CUDA is present.
+        blk_t = torch.tensor(block_indices, dtype=torch.long)
+        slt_t = torch.tensor(slot_indices, dtype=torch.long)
+        if self.device.type == "cuda":
+            blk_t = blk_t.pin_memory().to(self.device, non_blocking=True)
+            slt_t = slt_t.pin_memory().to(self.device, non_blocking=True)
+        else:
+            blk_t = blk_t.to(self.device)
+            slt_t = slt_t.to(self.device)
 
         # pool shape: (max_blocks, block_size, num_kv_heads, head_dim)
         # Result:     (total_tokens, num_kv_heads, head_dim)
         packed_k = k_pool[blk_t, slt_t]
         packed_v = v_pool[blk_t, slt_t]
 
-        # --- 4. cu_seqlens_k — cumulative sum of Python ints, pinned transfer ---
-        # torch.tensor() on a tiny CPU list + .to(device) is faster than
-        # computing cumsum on GPU for the small N typical here.
+        # --- 4. cu_seqlens_k — cumulative sum of Python ints ---
         cu_cpu = torch.tensor([0] + seq_lengths, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens_k = cu_cpu.pin_memory().to(self.device, non_blocking=True)
+        if self.device.type == "cuda":
+            cu_seqlens_k = cu_cpu.pin_memory().to(self.device, non_blocking=True)
+        else:
+            cu_seqlens_k = cu_cpu.to(self.device)
 
         return packed_k, packed_v, cu_seqlens_k, max_seqlen_k
 

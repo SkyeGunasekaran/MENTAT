@@ -3,16 +3,15 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
-from paged_kv_cache import PagedKVCacheManager
-from generator_utils import TreeNode, PrefixTree, compute_entropy, apply_repetition_penalty, _find_blocked_tokens, adaptive_threshold, PagedModelWrapper
+from core.paged_kv_cache import PagedKVCacheManager
+from core.generator_utils import TreeNode, PrefixTree, compute_entropy, apply_repetition_penalty, _find_blocked_tokens, adaptive_threshold, PagedModelWrapper
 from adapters.adapter_factory import ModelAdapter, get_adapter
 
-class PagedPrefixTreeUQGenerator:
+class MentatGenerator:
     """
     Uncertainty-quantification generator using entropy-gated prefix-tree
     branching, backed by paged KV-cache and batched decoding.

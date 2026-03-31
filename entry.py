@@ -50,7 +50,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from adapters.adapter_factory import get_adapter
-from generator import PagedPrefixTreeUQGenerator
+from core.generator import MentatGenerator
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -429,7 +429,7 @@ def run_generation(body: dict, chat_template: str | None) -> dict:
     soft_explore_window = overrides.get("soft_explore_window", _args.soft_explore_window)
     soft_explore_initial = overrides.get("soft_explore_initial", _args.soft_explore_initial)
 
-    gen = PagedPrefixTreeUQGenerator(
+    gen = MentatGenerator(
         _model,
         _tokenizer,
         adapter=_adapter,

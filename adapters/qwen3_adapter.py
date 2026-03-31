@@ -2,10 +2,7 @@ from adapters.model_adapter import ModelAdapter
 import torch
 from einops import rearrange
 
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-except ImportError:
-     "Flash attention not found! Please install with `pip install flash_attn --no-build-isolation`!"
+from adapters.attention_backend import attn_prefill, attn_decode
 
 class Qwen3Adapter(ModelAdapter):
     """
@@ -183,8 +180,8 @@ class Qwen3Adapter(ModelAdapter):
         q = self._apply_cos_sin(q, cos, sin)
         k = self._apply_cos_sin(k, cos, sin)
 
-        window = (-1, -1) if window_size is None else (window_size - 1, 0)
-        o = flash_attn_func(q, k, v, causal=True, window_size=window)
+        window = None if window_size is None else window_size
+        o = attn_prefill(q, k, v, window_size=window)
         # o: (1, seq_len, num_heads, head_dim)
 
         # Cache needs (seq_len, num_kv_heads, head_dim) — just drop batch dim.
@@ -258,14 +255,13 @@ class Qwen3Adapter(ModelAdapter):
 
         cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
 
-        window = (-1, -1) if window_size is None else (window_size - 1, 0)
-        o = flash_attn_varlen_func(
+        window = None if window_size is None else window_size
+        o = attn_decode(
             q_flat, packed_k, packed_v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=1,
             max_seqlen_k=max_seqlen_k,
-            causal=True,
+            N=N,
             window_size=window,
         )
         # o: (N, num_heads, head_dim) → reshape and project

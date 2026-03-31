@@ -31,10 +31,7 @@ from typing import Optional
 import torch
 from einops import rearrange
 
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-except ImportError:
-     "Flash attention not found! Please install with `pip install flash_attn --no-build-isolation`!"
+from adapters.attention_backend import BACKEND, attn_prefill, attn_decode
 
 
 # Inheritor Class
@@ -199,9 +196,9 @@ class ModelAdapter(abc.ABC):
         v: torch.Tensor,
         window_size: Optional[int] = None,
     ) -> torch.Tensor:
-        """Causal flash attention for prefill.  (B, S, H, D) layout."""
-        window = (-1, -1) if window_size is None else (window_size - 1, 0)
-        return flash_attn_func(q, k, v, causal=True, window_size=window)
+        """Causal attention for prefill.  (B, S, H, D) layout.
+        Dispatches to FlashAttention or SDPA depending on availability."""
+        return attn_prefill(q, k, v, window_size)
 
     def flash_decode(
         self,
@@ -214,16 +211,12 @@ class ModelAdapter(abc.ABC):
         N: int,
         window_size: Optional[int] = None,
     ) -> torch.Tensor:
-        """Varlen flash attention for batched decode."""
-        window = (-1, -1) if window_size is None else (window_size - 1, 0)
-        return flash_attn_varlen_func(
+        """Variable-length batched decode attention.
+        Dispatches to FlashAttention or SDPA depending on availability."""
+        return attn_decode(
             q, k, v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=1,
-            max_seqlen_k=max_seqlen_k,
-            causal=True,
-            window_size=window,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_k, N, window_size,
         )
 
     # ------------------------------------------------------------------
