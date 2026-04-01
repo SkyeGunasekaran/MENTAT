@@ -33,9 +33,9 @@ class MentatGenerator:
         *,
         adapter: ModelAdapter | None = None,
         max_active_branches: int = 10,
-        branching_factor: int = 3,
-        relative_entropy_multiplier: float = 1.35,
-        entropy_ema_alpha: float = 0.3,
+        branching_factor: int = 2,
+        relative_entropy_multiplier: float = 1.25,
+        entropy_ema_alpha: float = 0.2,
         max_new_tokens: int = 256,
         temperature: float = 0.7,
         repetition_penalty: float = 1.2,
@@ -43,9 +43,9 @@ class MentatGenerator:
         block_size: int = 16,
         max_blocks: int = 8192,
         # Semantic diversity pruning
-        semantic_similarity_threshold: float = 0.90,
+        semantic_similarity_threshold: float = 0.95,
         ema_alpha: float = 0.3,
-        min_steps_before_prune: int = 10,
+        min_steps_before_prune: int = 5,
         # Soft exploration warmup
         soft_explore_window: int = 15,
         soft_explore_initial: float = 0.3,
@@ -167,31 +167,7 @@ class MentatGenerator:
         )
         tree.root.children[0] = first_leaf
 
-        # --- Evaluate First Leaf (Step 0) ---
-        pen = apply_repetition_penalty(logits, [], penalty=self.rep_penalty)
-        probs = F.softmax(pen / self.temperature, dim=-1)
-        log_p = F.log_softmax(pen / self.temperature, dim=-1)
-        entropy = -torch.nan_to_num(probs * log_p, nan=0.0).sum(dim=-1).item()
-        
-        self.entropy_trace.append((0, first_leaf.node_id, entropy))
-        first_leaf.entropy_ema = entropy
-        
-        dynamic_multiplier = adaptive_threshold(self.relative_entropy_multiplier, self.M, 1)
-        warmup = self._soft_explore_factor(0)
-        tau = entropy * dynamic_multiplier * warmup
-        
-        gen_log_probs = F.log_softmax(pen, dim=-1)
-        if entropy > tau and self.M >= self.K:
-            topk_vals, topk_ids = torch.topk(gen_log_probs, self.K, dim=-1)
-            children = tree.branch_leaf(first_leaf, topk_ids.tolist(), topk_vals.tolist())
-            self.branch_points.append((0, entropy, len(children)))
-            for child in children:
-                child.creation_step = 0
-                self._handle_eos(tree, child)
-        else:
-            best_val, best_id = torch.max(gen_log_probs, dim=-1)
-            tree.extend_leaf(first_leaf, best_id.item(), best_val.item())
-            self._handle_eos(tree, first_leaf)
+        self._step_leaf(tree, first_leaf, logits, step=0, num_active=1)
 
         # ---- Main decode loop ----
         _t0_decode = time.perf_counter()
@@ -207,88 +183,21 @@ class MentatGenerator:
             token_ids_batch = [leaf.token_ids[-1] for leaf in active]
             seq_ids_batch = [leaf.seq_id for leaf in active]
 
-            logits_batch, hidden_states = self.wrapper.decode_batch(
+            logits_list, hidden_states = self.wrapper.decode_batch(
                 token_ids_batch, seq_ids_batch,
             )
-            # logits_batch: (N, vocab_size) — already a single tensor
             # Each forward pass decodes one token per active sequence.
             self._total_tokens_decoded += num_active
 
             # -- Update semantic vectors via EMA --
             self._update_semantic_vectors(active, hidden_states)
 
-            # 1. Apply repetition penalty in-place on the (N, V) tensor.
-            #    The penalty loop is sequential because each leaf has a
-            #    different token history, but we avoid cloning / restacking
-            #    by writing directly into the batched tensor.
-            for i, leaf in enumerate(active):
-                seq_so_far = leaf.get_full_sequence()
-                if seq_so_far and self.rep_penalty != 1.0:
-                    unique_tokens_t = torch.tensor(
-                        list(set(seq_so_far)),
-                        dtype=torch.long,
-                        device=logits_batch.device,
-                    )
-                    gathered = logits_batch[i, unique_tokens_t]
-                    gathered = torch.where(
-                        gathered > 0,
-                        gathered / self.rep_penalty,
-                        gathered * self.rep_penalty,
-                    )
-                    logits_batch[i, unique_tokens_t] = gathered
-            
-            # 3. Compute Entropies in batch (pure GPU)
-            probs = F.softmax(logits_batch / self.temperature, dim=-1)
-            log_p = F.log_softmax(logits_batch / self.temperature, dim=-1)
-            entropies = -torch.nan_to_num(probs * log_p, nan=0.0).sum(dim=-1)
-            
-            # 4. Compute log probabilities for generation in batch
-            gen_log_probs = F.log_softmax(logits_batch, dim=-1)
-            
-            # 5. Batched Top-K and Argmax on GPU
-            topk_vals, topk_ids = torch.topk(gen_log_probs, self.K, dim=-1)
-            best_vals, best_ids = torch.max(gen_log_probs, dim=-1)
-            
-            # 6. THE SINGLE CPU SYNCHRONIZATION POINT 
-            entropies_cpu = entropies.tolist()
-            topk_vals_cpu = topk_vals.tolist()
-            topk_ids_cpu = topk_ids.tolist()
-            best_vals_cpu = best_vals.tolist()
-            best_ids_cpu = best_ids.tolist()
-
-            # 7. Apply decisions in pure Python
-            for i, leaf in enumerate(list(active)):
+            # -- Per-leaf branch/extend decisions (unified path with
+            #    soft-exploration warmup baked into the threshold) --
+            for leaf, leaf_logits in zip(list(active), logits_list):
                 if not leaf.is_active:
                     continue
-                
-                entropy = entropies_cpu[i]
-                self.entropy_trace.append((step, leaf.node_id, entropy))
-
-                # Update EMA locally
-                if leaf.entropy_ema is None:
-                    leaf.entropy_ema = entropy
-                else:
-                    leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
-
-                dynamic_multiplier = adaptive_threshold(self.relative_entropy_multiplier, self.M, num_active)
-                warmup = self._soft_explore_factor(step)
-                tau = leaf.entropy_ema * dynamic_multiplier * warmup
-
-                headroom = self.M - num_active
-                can_branch = (entropy > tau) and (headroom >= self.K)
-
-                if can_branch:
-                    # Branch using precomputed lists
-                    children = tree.branch_leaf(leaf, topk_ids_cpu[i], topk_vals_cpu[i])
-                    self.branch_points.append((step, entropy, len(children)))
-                    for child in children: 
-                        child.creation_step = step
-                        self._handle_eos(tree, child)
-                else:
-                    # Extend using precomputed lists
-                    tree.extend_leaf(leaf, best_ids_cpu[i], best_vals_cpu[i])
-                    self._handle_eos(tree, leaf)
-            # --- END NEW BATCHED EVALUATION LOGIC ---
+                self._step_leaf(tree, leaf, leaf_logits, step, num_active)
 
             # -- Semantic diversity prune  --
             self._prune_similar(tree, step)
@@ -363,6 +272,50 @@ class MentatGenerator:
     #  Branching helpers
     # ------------------------------------------------------------------
 
+    def _do_branch(
+        self,
+        tree: PrefixTree,
+        leaf: TreeNode,
+        logits: torch.Tensor,
+        step: int,
+    ):
+        """Branch *leaf* into top-K children via paged fork."""
+        log_probs = F.log_softmax(logits, dim=-1)
+        topk_vals, topk_ids = torch.topk(log_probs, self.K)
+
+        token_ids = topk_ids.tolist()
+        token_lps = topk_vals.tolist()
+
+        # branch_leaf internally calls kv_cache_mgr.fork_sequence()
+        # for each child — O(1) per fork, no tensor copies.
+        children = tree.branch_leaf(leaf, token_ids, token_lps)
+        self.branch_points.append(
+            (step, compute_entropy(logits), len(children))
+        )
+
+        for child in children: 
+            child.creation_step = step
+            self._handle_eos(tree, child)
+
+
+    def _do_extend(
+        self,
+        tree: PrefixTree,
+        leaf: TreeNode,
+        logits: torch.Tensor,
+    ):
+        """Greedy-extend *leaf* by one token."""
+        log_probs = F.log_softmax(logits, dim=-1)
+        best_id = torch.argmax(log_probs).item()
+        best_lp = log_probs[best_id].item()
+
+        tree.extend_leaf(leaf, best_id, best_lp)
+
+        self._handle_eos(tree, leaf)
+    # ------------------------------------------------------------------
+    #  Entropy-gated branching with soft-exploration warmup
+    # ------------------------------------------------------------------
+
     def _soft_explore_factor(self, step: int) -> float:
         """
         Returns a multiplier in [soft_explore_initial, 1.0] that linearly
@@ -376,6 +329,50 @@ class MentatGenerator:
         # Linear ramp: initial → 1.0
         t = step / max(self.soft_explore_window, 1)
         return self.soft_explore_initial + (1.0 - self.soft_explore_initial) * t
+
+    def _step_leaf(
+        self,
+        tree: PrefixTree,
+        leaf: TreeNode,
+        logits: torch.Tensor,
+        step: int,
+        num_active: int,
+    ):
+        """Decide whether to branch or greedy-extend *leaf*."""
+        entropy = compute_entropy(logits, self.temperature)
+        self.entropy_trace.append((step, leaf.node_id, entropy))
+
+        # Update the sequence's specific entropy EMA
+        if leaf.entropy_ema is None:
+            leaf.entropy_ema = entropy
+        else:
+            leaf.entropy_ema = (self.entropy_ema_alpha * entropy) + ((1.0 - self.entropy_ema_alpha) * leaf.entropy_ema)
+
+        # Calculate the dynamic multiplier based on tree capacity
+        dynamic_multiplier = adaptive_threshold(self.relative_entropy_multiplier, self.M, num_active)
+
+        # Apply soft-exploration warmup: early steps scale the threshold
+        # down so branching is easier (more permissive), then ramp to
+        # full strictness over soft_explore_window steps.
+        warmup = self._soft_explore_factor(step)
+        
+        # The threshold is EMA × capacity multiplier × warmup factor
+        tau = leaf.entropy_ema * dynamic_multiplier * warmup
+
+        seq_so_far = leaf.get_full_sequence()
+        penalized = apply_repetition_penalty(
+            logits, seq_so_far,
+            penalty=self.rep_penalty
+        )
+
+        headroom = self.M - num_active
+        can_branch = (entropy > tau) and (headroom >= self.K)
+
+        if can_branch:
+            self._do_branch(tree, leaf, penalized, step)
+        else:
+            self._do_extend(tree, leaf, penalized)
+
     def _update_semantic_vectors(
         self,
         leaves: list[TreeNode],
@@ -399,6 +396,7 @@ class MentatGenerator:
             else:
                 # EMA: v_new = α * h + (1 − α) * v_old
                 leaf.semantic_vector.mul_(1.0 - alpha).add_(h, alpha=alpha)
+
     def _prune_similar(self, tree: PrefixTree, step: int):
         """
         Pairwise cosine-similarity diversity pruning.

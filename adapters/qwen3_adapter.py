@@ -250,7 +250,7 @@ class Qwen3Adapter(ModelAdapter):
         q_flat = q.squeeze(1)
 
         packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
-            seq_ids, layer_idx, cached_metadata=cached_gather_indices,
+            seq_ids, layer_idx,
         )
 
         cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)

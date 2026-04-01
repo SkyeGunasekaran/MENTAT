@@ -214,15 +214,9 @@ def apply_repetition_penalty(
 
     logits = logits.clone()
 
-    # Create a tensor on the same device as logits to avoid implicit host-to-device syncs
-    # during indexing.
-    unique_tokens_t = torch.tensor(
-        list(set(token_ids)), 
-        dtype=torch.long, 
-        device=logits.device
-    )
-
-    gathered = logits[unique_tokens_t]
+    # Standard repetition penalty 
+    unique_tokens = list(set(token_ids))
+    gathered = logits[unique_tokens]
 
     # Apply the multiplicative penalty
     gathered = torch.where(
@@ -231,9 +225,10 @@ def apply_repetition_penalty(
         gathered * penalty,
     )
 
-    logits[unique_tokens_t] = gathered
+    logits[unique_tokens] = gathered
 
     return logits
+
 
 def _find_blocked_tokens(token_ids: list[int], max_n: int) -> set[int]:
     blocked: set[int] = set()
@@ -347,7 +342,7 @@ class PagedModelWrapper:
         self,
         token_ids_per_seq: list[int],
         seq_ids: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
         """
         Decode one token per sequence for a batch of active leaves.
 
@@ -355,21 +350,12 @@ class PagedModelWrapper:
         layer-by-layer, then attention gathers from the full history
         (including the just-appended token).
 
-        Performance notes:
-          - ``plan_append_batched`` runs the per-sequence asymmetric
-            allocation/CoW logic in pure Python (no GPU work).  The GPU
-            work (CoW block copies + token writes) is issued in bulk by
-            ``execute_append_batched``.
-          - Gather metadata (block/slot index tensors, cu_seqlens_k) is
-            built once after layer 0's append and reused for all subsequent
-            layers, eliminating N-1 redundant Python→GPU index uploads.
-
         Args:
             token_ids_per_seq: list of N token ids (one per leaf).
             seq_ids:           list of N paged-cache sequence ids.
 
         Returns:
-            all_logits:    (N, vocab_size) batched logits tensor.
+            logits_list:   List of N logits tensors, each (vocab_size,).
             hidden_states: (N, D) final hidden states before lm_head.
         """
         adapter = self.adapter
@@ -378,10 +364,7 @@ class PagedModelWrapper:
 
         if N == 0:
             D = self.config.hidden_size
-            V = self.config.vocab_size
-            empty_d = torch.empty(0, D, device=self.device, dtype=self.dtype)
-            empty_v = torch.empty(0, V, device=self.device, dtype=self.dtype)
-            return empty_v, empty_d
+            return [], torch.empty(0, D, device=self.device, dtype=self.dtype)
 
         # -- Embedding --
         ids = torch.tensor(
@@ -395,21 +378,6 @@ class PagedModelWrapper:
             self.kv_cache_mgr.get_kv_length(sid) for sid in seq_ids
         ]
 
-        # --- Pre-compute all per-layer append plans (Phase 1: pure Python) ---
-        # The asymmetric allocation/CoW decisions must be done per-layer
-        # because CoW state can differ across layers after forking.  But we
-        # pull all the Python logic out of the GPU-hot layer loop.
-        append_plans = []
-        for layer_idx in range(adapter.num_layers):
-            plan = self.kv_cache_mgr.plan_append_batched(seq_ids, layer_idx)
-            append_plans.append(plan)
-
-        # Gather metadata is built AFTER layer 0's append executes (so the
-        # just-appended tokens are included in the gather).  It is reused
-        # for layers 1..N-1 because the page tables are structurally
-        # symmetric across layers.
-        gather_metadata = None
-
         for layer_idx, block in enumerate(adapter.layers):
             attn = adapter.get_self_attn(block)
 
@@ -422,27 +390,17 @@ class PagedModelWrapper:
             k_new, v_new = adapter.project_kv_for_cache(
                 attn, attn_input, seqlen_offsets,
             )
-
-            # Execute the pre-planned append (Phase 2: batched GPU work).
-            block_indices, slot_indices, cow_pairs = append_plans[layer_idx]
-            self.kv_cache_mgr.execute_append_batched(
-                layer_idx, k_new, v_new,
-                block_indices, slot_indices, cow_pairs,
+            self.kv_cache_mgr.append_tokens_batched(
+                seq_ids=seq_ids,
+                layer_idx=layer_idx,
+                k=k_new,
+                v=v_new,
             )
-
-            # Build gather metadata once after layer 0's append.
-            # All layers share the same page-table structure, so the
-            # index tensors are reusable across layers.
-            if layer_idx == 0:
-                gather_metadata = self.kv_cache_mgr.build_gather_metadata(
-                    seq_ids, layer_idx=0,
-                )
 
             # Step 2: Q-only projection + varlen flash attention over cache.
             attn_out = adapter.forward_paged_decode(
                 attn, attn_input, self.kv_cache_mgr,
                 seq_ids, seqlen_offsets, layer_idx,
-                cached_gather_indices=gather_metadata,
             )
 
             hidden = adapter.apply_post_attn_residual(block, residual, attn_out)
@@ -457,7 +415,7 @@ class PagedModelWrapper:
         hidden_flat = hidden.squeeze(0)         # (N, D)
         all_logits = adapter.lm_head(hidden_flat)  # (N, vocab_size)
 
-        return all_logits, hidden_flat
+        return [all_logits[i] for i in range(N)], hidden_flat
 
     # ------------------------------------------------------------------
     def is_eos(self, token_id: int) -> bool:
