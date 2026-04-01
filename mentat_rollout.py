@@ -31,9 +31,7 @@ from utils.shared import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Generation (Mentat UQ Rollout)
-# ---------------------------------------------------------------------------
+# generation stuff
 
 def run_mentat_rollout(
     model,
@@ -160,9 +158,7 @@ def run_mentat_rollout(
     }
 
 
-# ---------------------------------------------------------------------------
-# Pretty printing (Aligned with baseline_rollout.py + Diagnostics)
-# ---------------------------------------------------------------------------
+# look cool
 
 def print_result(result: dict):
     print(f"\n{'=' * 72}")

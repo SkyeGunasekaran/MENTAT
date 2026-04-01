@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """
-Mentat vs. Standard Sampling — Reasoning Benchmark Evaluation
-=============================================================
-
-End-to-end evaluation harness that compares entropy-gated prefix-tree
-branching (Mentat) against standard i.i.d. sampling on tasks with
-verifiable ground-truth answers.
-
 Benchmarks
 ----------
-- **GSM8K**       : grade-school math word problems  (numeric answer)
-- **MATH**        : competition math                  (numeric / LaTeX answer)
-- **ARC-Challenge**: science multiple-choice           (letter answer)
+- GSM8K: grade-school math word problems 
+- MATH: competition math                  
+- ARC-Challenge: science multiple-choice           
 
 Metrics
 -------
-- **acc@k** : fraction of problems where *at least one* of the top-k
-  completions contains the correct answer.
-- **efficiency@k** : ratio  acc_mentat@k / acc_standard@k
-- **mean branches** : average active branches Mentat used per problem
-- **wall-time per problem** : total generation time / num_problems
+- acc@k: fraction of problems where at least one of the top-K completions contains the correct answer.
+- efficiency@k: ratio  acc_mentat@k / acc_standard@k
+- mean branches: average active branches Mentat used per problem
+- wall-time per problem: total generation time / num_problems
 
 Usage
 -----
@@ -31,11 +23,6 @@ Usage
         --chat-template auto \\
         --temperature 0.7 \\
         --output_dir ./eval_results
-
-Requirements
-------------
-  torch, transformers, datasets, einops  (+ your Mentat codebase on PYTHONPATH)
-  No additional pip installs needed beyond these.
 """
 
 from __future__ import annotations
@@ -57,11 +44,9 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
-# ---------------------------------------------------------------------------
-#  Mentat imports — adjust if your package layout differs
-# ---------------------------------------------------------------------------
 from core.generator import MentatGenerator
 from adapters.adapter_factory import get_adapter
+from utils.shared import BUILTIN_TEMPLATES
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -76,9 +61,7 @@ DEFAULT_TOKEN_BUDGETS: dict[str, int] = {
     "arc":   128,
 }
 
-# ============================================================================
-#  1.  ANSWER EXTRACTION & GRADING
-# ============================================================================
+# Utils 
 
 _GSM8K_ANS_RE = re.compile(r"####\s*(-?[\d,]+\.?\d*)")
 _NUMERIC_RE = re.compile(r"(-?\d[\d,]*\.?\d*)")
@@ -192,9 +175,6 @@ def grade_arc(pred: str, gold: str) -> bool:
     return pred.strip().upper() == gold.strip().upper()
 
 
-# ============================================================================
-#  2.  BENCHMARK LOADERS  (chat-template aware)
-# ============================================================================
 
 @dataclass
 class Problem:
@@ -329,9 +309,7 @@ EXTRACTORS = {
 }
 
 
-# ============================================================================
-#  3.  STANDARD SAMPLING BASELINE
-# ============================================================================
+# standard baseline 
 
 @torch.no_grad()
 def standard_sample(
@@ -374,9 +352,7 @@ def standard_sample(
     return results
 
 
-# ============================================================================
-#  4.  SCORING ENGINE
-# ============================================================================
+# scoring 
 
 def compute_acc_at_k(
     completions: list[dict],
@@ -397,9 +373,7 @@ def compute_acc_at_k(
     return results
 
 
-# ============================================================================
-#  5.  MAIN EVALUATION LOOP
-# ============================================================================
+# main eval
 
 def run_evaluation(args):
     print("=" * 72)
@@ -792,12 +766,12 @@ def main():
         help="Sampling temperature for both methods (default: 0.7)",
     )
     parser.add_argument(
-        "--max_branches", type=int, default=12,
-        help="Mentat max_active_branches (default: 30)",
+        "--max_branches", type=int, default=10,
+        help="Mentat max_active_branches (default: 10)",
     )
     parser.add_argument(
         "--branching_factor", type=int, default=3,
-        help="Mentat branching_factor (default: 5)",
+        help="Mentat branching_factor (default: 3)",
     )
     parser.add_argument(
         "--repetition_penalty", type=float, default=1.2,
