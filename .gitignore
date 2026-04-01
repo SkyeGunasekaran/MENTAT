@@ -22,7 +22,6 @@ hf_models/
 *.json
 *.html
 *.csv
-*.txt
 *.stats
 # HuggingFace and Torch cache
 .cache/
