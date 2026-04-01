@@ -51,6 +51,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from adapters.adapter_factory import get_adapter
 from core.generator import MentatGenerator
+from utils.shared import (
+    resolve_chat_template, 
+    extract_answer, 
+    safe_float,
+    format_prompt_from_messages
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -112,221 +118,22 @@ _args = None
 _lock = Lock()          # serialize requests (single-request-at-a-time)
 
 
-# ---------------------------------------------------------------------------
-# Built-in chat templates (fallbacks when tokenizer doesn't ship one)
-# ---------------------------------------------------------------------------
-BUILTIN_TEMPLATES: dict[str, str] = {
-    # ── ChatML (OpenAI / Qwen default) ──────────────────────────────────
-    "chatml": (
-        "{% for message in messages %}"
-        "<|im_start|>{{ message['role'] }}\n"
-        "{{ message['content'] }}<|im_end|>\n"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}"
-        "<|im_start|>assistant\n"
-        "{% endif %}"
-    ),
-
-    # ── Llama 3 Instruct ────────────────────────────────────────────────
-    "llama3": (
-        "{% for message in messages %}"
-        "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
-        "{{ message['content'] }}<|eot_id|>"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}"
-        "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        "{% endif %}"
-    ),
-
-    # ── Mistral Instruct ────────────────────────────────────────────────
-    "mistral": (
-        "{% for message in messages %}"
-        "{% if message['role'] == 'user' %}"
-        "[INST] {{ message['content'] }} [/INST]"
-        "{% elif message['role'] == 'assistant' %}"
-        "{{ message['content'] }}</s> "
-        "{% endif %}"
-        "{% endfor %}"
-    ),
-
-    # ── Zephyr / Gemma style ────────────────────────────────────────────
-    "zephyr": (
-        "{% for message in messages %}"
-        "<|{{ message['role'] }}|>\n"
-        "{{ message['content'] }}<|endoftext|>\n"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}"
-        "<|assistant|>\n"
-        "{% endif %}"
-    ),
-
-    # ── DeepSeek R1 (think + answer) ───────────────────────────────────
-    "deepseek-r1": (
-        "{% for message in messages %}"
-        "{% if message['role'] == 'user' %}"
-        "User: {{ message['content'] }}\n\n"
-        "{% elif message['role'] == 'assistant' %}"
-        "Assistant: {{ message['content'] }}\n\n"
-        "{% elif message['role'] == 'system' %}"
-        "{{ message['content'] }}\n\n"
-        "{% endif %}"
-        "{% endfor %}"
-        "{% if add_generation_prompt %}"
-        "Assistant: <think>\n"
-        "{% endif %}"
-    ),
-
-    # ── No template (raw passthrough) ──────────────────────────────────
-    "none": "",
-}
 
 
-# ---------------------------------------------------------------------------
-# Chat template resolution
-# ---------------------------------------------------------------------------
-
-def resolve_chat_template(args: argparse.Namespace) -> str | None:
-    """
-    Resolve the effective chat template string.
-
-    Returns:
-        A Jinja2 template string, or None meaning "don't apply any template,
-        treat prompt as raw text".
-
-    Resolution order:
-        1. --chat-template none          → None  (raw completion mode)
-        2. --chat-template auto          → tokenizer's built-in template
-        3. --chat-template <builtin>     → one of BUILTIN_TEMPLATES
-        4. --chat-template <jinja str>   → user-supplied Jinja2 string
-    """
-    spec = args.chat_template
-
-    if spec == "none":
-        return None
-
-    if spec == "auto":
-        # Try the tokenizer's own template
-        tok_tmpl = getattr(_tokenizer, "chat_template", None)
-        if tok_tmpl:
-            # Could be a string or a dict of named templates
-            if isinstance(tok_tmpl, dict):
-                tmpl = tok_tmpl.get("default") or next(iter(tok_tmpl.values()))
-                logger.info(f"Chat template: tokenizer (named, using '{next(iter(tok_tmpl))}')")
-                return tmpl
-            logger.info("Chat template: tokenizer built-in")
-            return tok_tmpl
-        logger.info("Chat template: tokenizer has none → raw completion mode")
-        return None
-
-    if spec in BUILTIN_TEMPLATES:
-        tmpl = BUILTIN_TEMPLATES[spec]
-        if not tmpl:      # "none" entry
-            return None
-        logger.info(f"Chat template: built-in '{spec}'")
-        return tmpl
-
-    # Treat as a raw Jinja2 string
-    logger.info("Chat template: user-supplied Jinja2 string")
-    return spec
-
-
-def format_prompt(
-    body: dict,
-    chat_template: str | None,
-) -> str:
-    """
-    Turn the request body into a flat prompt string for the generator.
-
-    Supports two input shapes:
-        1. {"prompt": "raw text"}        → returned as-is
-        2. {"messages": [{role, content}]} → formatted via chat template
-
-    If the body has "messages" but no chat template is configured, we
-    concatenate the content fields with newlines (best-effort fallback).
-    """
-    # ── Raw prompt path ─────────────────────────────────────────────────
+def format_prompt(body: dict, chat_template: str | None) -> str:
     if "prompt" in body:
         return body["prompt"]
 
-    # ── Messages path ───────────────────────────────────────────────────
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
-        raise ValueError(
-            "Request must contain either 'prompt' (string) or "
-            "'messages' (list of {role, content} dicts)."
-        )
+        raise ValueError("...")
 
-    # Validate structure
-    for i, msg in enumerate(messages):
-        if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
-            raise ValueError(
-                f"messages[{i}] must be a dict with 'role' and 'content' keys."
-            )
-
-    if chat_template is not None:
-        # Use HuggingFace's apply_chat_template with our resolved template
-        return _tokenizer.apply_chat_template(
-            messages,
-            chat_template=chat_template,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    # No template — plain concatenation fallback
-    parts = []
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        if role == "system":
-            parts.append(content)
-        elif role == "user":
-            parts.append(f"User: {content}")
-        elif role == "assistant":
-            parts.append(f"Assistant: {content}")
-        else:
-            parts.append(content)
-    # Add generation cue
-    parts.append("Assistant:")
-    return "\n".join(parts)
+    return format_prompt_from_messages(_tokenizer, chat_template, messages)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def safe_float(x: Any) -> Any:
-    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-        return None
-    return round(x, 6) if isinstance(x, float) else x
-
-
-def extract_answer(text: str) -> str | None:
-    r"""
-    Try to pull a final answer from model output.
-
-    Checks (in order):
-        1. \boxed{...}          — standard math RLVR format
-        2. <answer>...</answer> — common RLVR tag format
-        3. ####  ...            — GSM8K-style
-    Returns None if nothing matched.
-    """
-    # \boxed{...} (handles nested braces one level deep)
-    m = re.search(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
-    if m:
-        return m.group(1).strip()
-
-    # <answer>...</answer>
-    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-
-    # #### answer
-    m = re.search(r"####\s*(.+?)(?:\n|$)", text)
-    if m:
-        return m.group(1).strip()
-
-    return None
-
 
 def build_response(
     prompt: str,

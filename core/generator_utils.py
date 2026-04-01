@@ -34,7 +34,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from paged_kv_cache import PagedKVCacheManager
+from core.paged_kv_cache import PagedKVCacheManager
 
 
 # ============================================================================

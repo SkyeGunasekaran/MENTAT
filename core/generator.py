@@ -32,25 +32,23 @@ class MentatGenerator:
         tokenizer,
         *,
         adapter: ModelAdapter | None = None,
-        max_active_branches: int = 30,
-        branching_factor: int = 5,
-        relative_entropy_multiplier: float = 1.5,
-        entropy_ema_alpha: float = 0.1,
+        max_active_branches: int = 10,
+        branching_factor: int = 2,
+        relative_entropy_multiplier: float = 1.25,
+        entropy_ema_alpha: float = 0.2,
         max_new_tokens: int = 256,
-        temperature: float = 1.0,
+        temperature: float = 0.7,
         repetition_penalty: float = 1.2,
-        frequency_penalty: float = 0.3,
-        max_ngram_block: int = 3,
         # Paged cache config
         block_size: int = 16,
-        max_blocks: int | None = None,
+        max_blocks: int = 8192,
         # Semantic diversity pruning
         semantic_similarity_threshold: float = 0.95,
         ema_alpha: float = 0.3,
-        min_steps_before_prune: int = 3,
+        min_steps_before_prune: int = 5,
         # Soft exploration warmup
-        soft_explore_window: int = 10,
-        soft_explore_initial: float = 0.5,
+        soft_explore_window: int = 15,
+        soft_explore_initial: float = 0.3,
     ):
         eos = tokenizer.eos_token_id
         if eos is None:
@@ -64,8 +62,6 @@ class MentatGenerator:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.rep_penalty = repetition_penalty
-        self.freq_penalty = frequency_penalty
-        self.max_ngram_block = max_ngram_block
         self.semantic_similarity_threshold = semantic_similarity_threshold
         self.ema_alpha = ema_alpha
         self.min_steps_before_prune = min_steps_before_prune

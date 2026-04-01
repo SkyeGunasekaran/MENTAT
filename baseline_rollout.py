@@ -1,24 +1,13 @@
 """
-RLVR Rollout Baseline
-====================
-
-Standard sampling rollout (prompting N times) using HuggingFace's
-`model.generate()` for RLVR-style data collection.
-
-Usage::
+Usage:
 
     python rollout_baseline.py \
         --model meta-llama/Llama-3.2-1B \
         --prompt "The meaning of life is" \
         --n 10 \
-        --temperature 0.7
-
-    # Chat-template mode
-    python rollout_baseline.py \
-        --model Qwen/Qwen2.5-7B-Instruct \
-        --prompt "What is 37 * 29?" \
+        --temperature 0.7 \
         --chat-template auto \
-        --n 10
+        ...
 """
 
 from __future__ import annotations
@@ -31,60 +20,13 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
-
-# ---------------------------------------------------------------------------
-# Answer extraction
-# ---------------------------------------------------------------------------
-
-def extract_answer(text: str) -> str | None:
-    r"""Try to pull a final answer from model output."""
-    m = re.search(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(r"####\s*(.+?)(?:\n|$)", text)
-    if m:
-        return m.group(1).strip()
-
-    return None
-
+from utils.shared import extract_answer, resolve_chat_template, format_prompt_from_messages
 
 # ---------------------------------------------------------------------------
-# Chat template handling
+# Generation 
 # ---------------------------------------------------------------------------
 
-def format_prompt(raw_prompt: str, tokenizer, chat_template: str) -> str:
-    if chat_template == "none":
-        return raw_prompt
-
-    messages = [{"role": "user", "content": raw_prompt}]
-
-    if chat_template == "auto":
-        tok_tmpl = getattr(tokenizer, "chat_template", None)
-        if tok_tmpl:
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-        return raw_prompt
-
-    return tokenizer.apply_chat_template(
-        messages,
-        chat_template=chat_template,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Generation (Updated for Sampling Rollouts)
-# ---------------------------------------------------------------------------
-
-def run_rollout(
+def run_baseline_rollout(
     model,
     tokenizer,
     prompt: str,
@@ -97,7 +39,14 @@ def run_rollout(
 ) -> dict:
     """Run N independent sampling rollouts on a single prompt."""
 
-    formatted = format_prompt(prompt, tokenizer, chat_template)
+    resolved_tmpl = resolve_chat_template(tokenizer, chat_template)
+    formatted = format_prompt_from_messages(
+        tokenizer, 
+        resolved_tmpl, 
+        [{"role": "user", "content": prompt}]
+    ) if resolved_tmpl else prompt
+
+    inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
     inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
@@ -255,7 +204,7 @@ def main():
     all_results = []
     for i, prompt in enumerate(prompts):
         print(f"[{i + 1}/{len(prompts)}] Rolling out...")
-        result = run_rollout(
+        result = run_baseline_rollout(
             model, tokenizer, prompt,
             n=args.n,
             max_new_tokens=args.max_new_tokens,

@@ -1,0 +1,34 @@
+# Byte-compiled 
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE 
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project-specific output artifacts
+eval_results/
+hf_models/
+*.json
+*.html
+*.csv
+*.txt
+*.stats
+# HuggingFace and Torch cache
+.cache/
+hf_cache/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
