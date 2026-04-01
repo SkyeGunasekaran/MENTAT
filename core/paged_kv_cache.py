@@ -139,6 +139,7 @@ class PagedKVCacheManager:
 
         self._sequences: dict[int, SequenceState] = {}
         self._next_seq_id: int = 0
+        self._dtype_size: int = torch.tensor([], dtype=self.dtype).element_size()
 
     def allocate_sequence(self) -> int:
         seq_id = self._next_seq_id
@@ -224,26 +225,35 @@ class PagedKVCacheManager:
 
         seq.num_tokens[layer_idx] += num_new
         
-    def append_tokens_batched(
+    def plan_append_batched(
         self,
         seq_ids: list[int],
         layer_idx: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> None:
+    ) -> tuple[list[int], list[int], list[tuple[int, int]]]:
         """
-        Append 1 token for N sequences in a single batched GPU operation.
-        k, v expected shapes: (N, num_key_value_heads, head_dim)
+        Phase 1 (pure Python): Make all allocation, CoW, and slot decisions
+        for appending 1 token per sequence.  **No GPU work is issued.**
+
+        Because block allocation is asymmetric (each sequence may or may not
+        need a new block / CoW copy), this loop must remain sequential.  But
+        by separating it from GPU execution we ensure the GPU is never stalled
+        waiting for Python to advance to the next iteration.
+
+        Args:
+            seq_ids:   list of N paged-cache sequence ids.
+            layer_idx: which layer's page table to update.
+
+        Returns:
+            block_indices: length-N list of destination block indices.
+            slot_indices:  length-N list of destination slot indices.
+            cow_pairs:     list of (src_block, dst_block) pairs that need
+                           a full-block copy before the token write.
         """
-        N = len(seq_ids)
-        if N == 0:
-            return
+        block_indices: list[int] = []
+        slot_indices: list[int] = []
+        cow_pairs: list[tuple[int, int]] = []
 
-        block_indices = []
-        slot_indices = []
-
-        # 1. State updates & allocations (Fast Python logic)
-        for i, seq_id in enumerate(seq_ids):
+        for seq_id in seq_ids:
             seq = self._sequences[seq_id]
             page_table = seq.page_table[layer_idx]
 
@@ -255,60 +265,109 @@ class PagedKVCacheManager:
 
             tail_blk = page_table[-1]
 
-            # CoW copy if shared
+            # CoW: record the pair, allocate new block, update page table —
+            # but do NOT issue the GPU copy yet.
             if self.allocator.is_shared(tail_blk):
                 new_blk = self.allocator.alloc()
-                self.k_pools[layer_idx][new_blk].copy_(self.k_pools[layer_idx][tail_blk])
-                self.v_pools[layer_idx][new_blk].copy_(self.v_pools[layer_idx][tail_blk])
+                cow_pairs.append((tail_blk, new_blk))
                 self.allocator.release(tail_blk)
                 page_table[-1] = new_blk
                 tail_blk = new_blk
 
-            # Record destinations for this sequence
+            # Record write destination
             slot_start = seq.tokens_in_last_block[layer_idx]
             block_indices.append(tail_blk)
             slot_indices.append(slot_start)
 
-            # Update counters (assuming decode step = 1 token at a time)
+            # Update counters
             seq.tokens_in_last_block[layer_idx] += 1
             seq.num_tokens[layer_idx] += 1
 
+        return block_indices, slot_indices, cow_pairs
 
-        # 2. Vectorized write (Single GPU Kernel)
-        # Convert index lists to tensors for advanced indexing
-        block_idx_t = torch.tensor(block_indices, device=self.device, dtype=torch.long)
-        slot_idx_t = torch.tensor(slot_indices, device=self.device, dtype=torch.long)
-
-        # Write all N tokens to their respective blocks and slots simultaneously
-        self.k_pools[layer_idx][block_idx_t, slot_idx_t] = k
-        self.v_pools[layer_idx][block_idx_t, slot_idx_t] = v
-    def get_kv_length(self, seq_id: int) -> int:
-        # All layers should have the same logical length, so reading layer 0 is safe
-        return self._sequences[seq_id].num_tokens[0]
-
-    def build_packed_kv(
+    def execute_append_batched(
         self,
-        seq_ids: list[int],
         layer_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_indices: list[int],
+        slot_indices: list[int],
+        cow_pairs: list[tuple[int, int]],
+    ) -> None:
         """
-        Gather K and V for all sequences into a single packed (varlen) tensor.
+        Phase 2 (batched GPU): Execute all CoW copies and token writes
+        that were planned by ``plan_append_batched``.
 
-        Returns:
-            packed_k:    (total_tokens, num_kv_heads, head_dim)
-            packed_v:    (total_tokens, num_kv_heads, head_dim)
-            cu_seqlens_k: (N+1,) int32 cumulative sequence lengths on device
-            max_seqlen_k: int — longest sequence in the batch (for FlashAttn)
+        All GPU work is issued in bulk — at most 3 kernel launches
+        regardless of how many sequences need CoW:
+          1. One batched gather+scatter for all CoW copies (if any).
+          2. One indexed write for K tokens.
+          3. One indexed write for V tokens.
+
+        Args:
+            layer_idx:     which layer's pool to write into.
+            k, v:          (N, num_kv_heads, head_dim) new token KV.
+            block_indices: from plan_append_batched.
+            slot_indices:  from plan_append_batched.
+            cow_pairs:     from plan_append_batched.
         """
         k_pool = self.k_pools[layer_idx]
         v_pool = self.v_pools[layer_idx]
 
-        # --- 1. Collect lengths and build flat gather indices in Python ---
-        # All arithmetic is on small Python ints; no GPU ops here.
-        # The gather indices (block_idx, slot_idx) are identical across all
-        # layers because blocks are allocated symmetrically.  We therefore
-        # cache them on each SequenceState after the first build and reuse
-        # them for layers 1-N, saving N-1 list-construction passes per step.
+        # --- Batched CoW copies (single gather → single scatter) ---
+        if cow_pairs:
+            src_blocks = [s for s, _ in cow_pairs]
+            dst_blocks = [d for _, d in cow_pairs]
+            src_t = torch.tensor(src_blocks, dtype=torch.long, device=self.device)
+            dst_t = torch.tensor(dst_blocks, dtype=torch.long, device=self.device)
+            # pool shape: (max_blocks, block_size, num_kv_heads, head_dim)
+            # index_copy_ on dim 0 copies full blocks in one kernel.
+            k_pool[dst_t] = k_pool[src_t]
+            v_pool[dst_t] = v_pool[src_t]
+
+        # --- Batched token write ---
+        blk_t = torch.tensor(block_indices, dtype=torch.long, device=self.device)
+        slt_t = torch.tensor(slot_indices, dtype=torch.long, device=self.device)
+        k_pool[blk_t, slt_t] = k
+        v_pool[blk_t, slt_t] = v
+
+    def append_tokens_batched(
+        self,
+        seq_ids: list[int],
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        """
+        Convenience wrapper: plan + execute in one call.
+        k, v expected shapes: (N, num_key_value_heads, head_dim)
+        """
+        N = len(seq_ids)
+        if N == 0:
+            return
+        block_indices, slot_indices, cow_pairs = self.plan_append_batched(seq_ids, layer_idx)
+        self.execute_append_batched(layer_idx, k, v, block_indices, slot_indices, cow_pairs)
+    def get_kv_length(self, seq_id: int) -> int:
+        # All layers should have the same logical length, so reading layer 0 is safe
+        return self._sequences[seq_id].num_tokens[0]
+
+    def build_gather_metadata(
+        self,
+        seq_ids: list[int],
+        layer_idx: int = 0,
+    ) -> dict | None:
+        """
+        Build the gather index tensors (block indices, slot indices,
+        cu_seqlens_k, max_seqlen_k) once.  These are identical across all
+        layers because pages are allocated symmetrically, so the caller can
+        build them for layer 0 and reuse for layers 1..N-1.
+
+        Returns None for an empty batch, otherwise a dict with:
+            blk_t:        (total_tokens,) long, on device
+            slt_t:        (total_tokens,) long, on device
+            cu_seqlens_k: (N+1,) int32, on device
+            max_seqlen_k: int
+        """
         seq_lengths: list[int] = []
         block_indices: list[int] = []
         slot_indices: list[int] = []
@@ -328,44 +387,74 @@ class PagedKVCacheManager:
                     break
 
         total_tokens = sum(seq_lengths)
-        max_seqlen_k = max(seq_lengths) if seq_lengths else 0
-
-        # --- 2. Early-exit for empty batch ---
         if total_tokens == 0:
+            return None
+
+        max_seqlen_k = max(seq_lengths)
+
+        # Build tensors on device — single upload per decode step.
+        blk_t = torch.tensor(block_indices, dtype=torch.long, device=self.device)
+        slt_t = torch.tensor(slot_indices, dtype=torch.long, device=self.device)
+
+        cu_cpu = torch.tensor(
+            [0] + seq_lengths, dtype=torch.int32,
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens_k = cu_cpu.to(self.device)
+
+        return {
+            "blk_t": blk_t,
+            "slt_t": slt_t,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_k": max_seqlen_k,
+        }
+
+    def build_packed_kv(
+        self,
+        seq_ids: list[int],
+        layer_idx: int,
+        cached_metadata: dict | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Gather K and V for all sequences into a single packed (varlen) tensor.
+
+        If ``cached_metadata`` is provided (from ``build_gather_metadata``),
+        the expensive Python index-building and tensor upload are skipped —
+        only the two gather kernels (K and V) are issued.
+
+        Returns:
+            packed_k:    (total_tokens, num_kv_heads, head_dim)
+            packed_v:    (total_tokens, num_kv_heads, head_dim)
+            cu_seqlens_k: (N+1,) int32 cumulative sequence lengths on device
+            max_seqlen_k: int — longest sequence in the batch (for FlashAttn)
+        """
+        # --- Use pre-built metadata if available ---
+        if cached_metadata is not None:
+            blk_t = cached_metadata["blk_t"]
+            slt_t = cached_metadata["slt_t"]
+            cu_seqlens_k = cached_metadata["cu_seqlens_k"]
+            max_seqlen_k = cached_metadata["max_seqlen_k"]
+
+            packed_k = self.k_pools[layer_idx][blk_t, slt_t]
+            packed_v = self.v_pools[layer_idx][blk_t, slt_t]
+            return packed_k, packed_v, cu_seqlens_k, max_seqlen_k
+
+        # --- Fallback: build from scratch (used by prefill, single-layer calls) ---
+        metadata = self.build_gather_metadata(seq_ids, layer_idx)
+
+        if metadata is None:
+            N = len(seq_ids)
             empty = torch.empty(
                 0, self.num_key_value_heads, self.head_dim,
                 device=self.device, dtype=self.dtype,
             )
-            cu = torch.zeros(
-                len(seq_ids) + 1, device=self.device, dtype=torch.int32,
-            )
+            cu = torch.zeros(N + 1, device=self.device, dtype=torch.int32)
             return empty, empty, cu, 0
 
-        # --- 3. Single gather (one kernel each for K and V) ---
-        # Upload index tensors once; they are small (total_tokens ints).
-        # pin_memory() is only available when CUDA is present.
-        blk_t = torch.tensor(block_indices, dtype=torch.long)
-        slt_t = torch.tensor(slot_indices, dtype=torch.long)
-        if self.device.type == "cuda":
-            blk_t = blk_t.pin_memory().to(self.device, non_blocking=True)
-            slt_t = slt_t.pin_memory().to(self.device, non_blocking=True)
-        else:
-            blk_t = blk_t.to(self.device)
-            slt_t = slt_t.to(self.device)
-
-        # pool shape: (max_blocks, block_size, num_kv_heads, head_dim)
-        # Result:     (total_tokens, num_kv_heads, head_dim)
-        packed_k = k_pool[blk_t, slt_t]
-        packed_v = v_pool[blk_t, slt_t]
-
-        # --- 4. cu_seqlens_k — cumulative sum of Python ints ---
-        cu_cpu = torch.tensor([0] + seq_lengths, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
-        if self.device.type == "cuda":
-            cu_seqlens_k = cu_cpu.pin_memory().to(self.device, non_blocking=True)
-        else:
-            cu_seqlens_k = cu_cpu.to(self.device)
-
-        return packed_k, packed_v, cu_seqlens_k, max_seqlen_k
+        blk_t = metadata["blk_t"]
+        slt_t = metadata["slt_t"]
+        packed_k = self.k_pools[layer_idx][blk_t, slt_t]
+        packed_v = self.v_pools[layer_idx][blk_t, slt_t]
+        return packed_k, packed_v, metadata["cu_seqlens_k"], metadata["max_seqlen_k"]
 
     def trim_to_window(self, seq_id: int, window_size: int) -> None:
         seq = self._sequences[seq_id]
@@ -440,7 +529,7 @@ class PagedKVCacheManager:
 
     @property
     def dtype_size(self) -> int:
-        return torch.tensor([], dtype=self.dtype).element_size()
+        return self._dtype_size
 
     def __repr__(self) -> str:
         stats = self.get_stats()
