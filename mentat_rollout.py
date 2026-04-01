@@ -42,7 +42,7 @@ def run_mentat_rollout(
 ) -> dict:
     """Run Mentat prefix-tree generation on a single prompt."""
 
-    # 1. Resolve and format the prompt
+    # 1. Resolve and format the prompt (Unchanged)
     resolved_tmpl = resolve_chat_template(tokenizer, args.chat_template)
     if resolved_tmpl:
         formatted = format_prompt_from_messages(
@@ -54,7 +54,7 @@ def run_mentat_rollout(
     inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
-    # 2. Initialize the generator
+    # 2. Initialize the generator (Unchanged)
     gen = MentatGenerator(
         model,
         tokenizer,
@@ -91,7 +91,6 @@ def run_mentat_rollout(
         text = r['text']
         length = max(len(tids), 1)
 
-        # Check completion status
         if isinstance(eos_id, (list, tuple)):
             complete = any(tids[-1] == e for e in eos_id) if tids else False
         else:
@@ -110,7 +109,7 @@ def run_mentat_rollout(
             "finish_reason": "stop" if complete else "length",
             "extracted_answer": extracted,
         })
-
+    sequences.sort(key=lambda x: (x["log_prob"], x["avg_log_prob"]), reverse=True)
     # 5. Compute Summaries
     n_with_answer = sum(1 for s in sequences if s["extracted_answer"] is not None)
     majority_answer = None
@@ -154,9 +153,8 @@ def run_mentat_rollout(
             "prompt_tokens": input_len,
             "completion_tokens": diag['decode_tokens_total'],
         },
-        "generator_ref": gen  # Temporarily attached for PyVis export if needed
+        "generator_ref": gen
     }
-
 
 # look cool
 
@@ -198,20 +196,20 @@ def parse_args() -> argparse.Namespace:
     model_group.add_argument("--chat-template", type=str, default="none")
 
     gen_group = parser.add_argument_group("Generation Defaults")
-    gen_group.add_argument("--max-new-tokens", type=int, default=512)
+    gen_group.add_argument("--max-new-tokens", type=int, default=256)
     gen_group.add_argument("--temperature", type=float, default=0.7)
-    gen_group.add_argument("--repetition-penalty", type=float, default=1.0)
+    gen_group.add_argument("--repetition-penalty", type=float, default=1.2)
 
     uq_group = parser.add_argument_group("Mentat UQ Parameters")
     uq_group.add_argument("--max-active", type=int, default=10, help="Max active branches")
-    uq_group.add_argument("--branching-factor", type=int, default=2, help="Children per branch point")
-    uq_group.add_argument("--entropy-ema-alpha", type=float, default=0.2)
-    uq_group.add_argument("--relative-entropy-multiplier", type=float, default=1.15)
+    uq_group.add_argument("--branching-factor", type=int, default=3, help="Children per branch point")
+    uq_group.add_argument("--entropy-ema-alpha", type=float, default=0.3)
+    uq_group.add_argument("--relative-entropy-multiplier", type=float, default=1.25)
     
     prune_group = parser.add_argument_group("Semantic Diversity Pruning")
-    prune_group.add_argument("--sim-threshold", type=float, default=0.75)
-    prune_group.add_argument("--ema-alpha", type=float, default=0.25)
-    prune_group.add_argument("--soft-explore-window", type=int, default=15)
+    prune_group.add_argument("--sim-threshold", type=float, default=0.85)
+    prune_group.add_argument("--ema-alpha", type=float, default=0.3)
+    prune_group.add_argument("--soft-explore-window", type=int, default=10)
     prune_group.add_argument("--soft-explore-initial", type=float, default=0.3)
 
     cache_group = parser.add_argument_group("Paged KV Cache")
