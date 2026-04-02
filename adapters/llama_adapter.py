@@ -177,12 +177,17 @@ class LlamaAdapter(ModelAdapter):
         """
         Batched decode attention for one Llama layer.
 
+        Uses the Triton PagedAttention kernel when the cache manager
+        supports it (decode_attention), otherwise falls back to the
+        gather + flash_attn_varlen / SDPA path.
+
         Returns:
             attn_output : (1, N, hidden_size)
         """
         N = len(seq_ids)
         _, total_q, _ = hidden_states.size()
 
+        # --- Q projection + RoPE (unchanged) ---
         hs = hidden_states.squeeze(0).unsqueeze(1)   # (N, 1, D)
         q, _, _ = self.project_qkv(attn, hs)
         # q: (N, 1, num_heads, head_dim)
@@ -194,20 +199,26 @@ class LlamaAdapter(ModelAdapter):
         q = self._apply_cos_sin(q, cos, sin)
         q_flat = q.squeeze(1)   # (N, num_heads, head_dim)
 
-        packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
-            seq_ids, layer_idx,
-        )
+        # --- Attention: Triton fast path vs. gather fallback ---
+        if hasattr(kv_cache_mgr, 'decode_attention'):
+            # Triton PagedAttention — reads K/V directly from paged pools.
+            # No build_packed_kv gather, no index tensor construction.
+            o = kv_cache_mgr.decode_attention(q_flat, seq_ids, layer_idx)
+        else:
+            # Original path: gather KV into packed tensors + varlen attention.
+            packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
+                seq_ids, layer_idx,
+            )
+            cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
+            o = attn_decode(
+                q_flat, packed_k, packed_v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seqlen_k,
+                N=N,
+                window_size=None,
+            )
 
-        cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
-
-        o = attn_decode(
-            q_flat, packed_k, packed_v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_k=max_seqlen_k,
-            N=N,
-            window_size=None,
-        )
         # o: (N, num_heads, head_dim)
         o = o.unsqueeze(0).reshape(1, total_q, -1)
         return attn.o_proj(o)
