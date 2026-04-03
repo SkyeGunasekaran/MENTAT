@@ -305,8 +305,7 @@ class ModelAdapter(abc.ABC):
     ) -> torch.Tensor:
         """
         Batched decode attention for one layer: project Q, apply RoPE,
-        then either use the Triton paged-attention kernel (if the cache
-        manager supports it) or fall back to gather + varlen flash attention.
+        gather packed KV from cache, run varlen flash attention.
 
         Returns:
             attn_output: (1, N, hidden_size)
@@ -326,22 +325,17 @@ class ModelAdapter(abc.ABC):
         q_rot_4d, _ = self.apply_rope(attn, q_4d, None, position_ids, v_for_shape=q_4d)
         q_rot = q_rot_4d.squeeze(1)  # (N, num_heads, head_dim)
 
-        # --- Attention: Triton fast path vs. gather fallback ---
-        if hasattr(kv_cache_mgr, 'decode_attention'):
-            # Triton PagedAttention — reads K/V directly from paged pools.
-            # No build_packed_kv gather, no index tensor construction.
-            o = kv_cache_mgr.decode_attention(q_rot, seq_ids, layer_idx)
-        else:
-            # Original path: gather KV into packed tensors + varlen attention.
-            packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
-                seq_ids, layer_idx, cached_metadata=cached_gather_indices,
-            )
-            cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
-            o = self.flash_decode(
-                q_rot, packed_k, packed_v,
-                cu_seqlens_q, cu_seqlens_k,
-                max_seqlen_k, N, window_size,
-            )
+        packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
+            seq_ids, layer_idx, cached_metadata=cached_gather_indices,
+        )
+
+        cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
+
+        o = self.flash_decode(
+            q_rot, packed_k, packed_v,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_k, N, window_size,
+        )
 
         o = o.unsqueeze(0).reshape(1, total_q, -1)
         return attn.o_proj(o)

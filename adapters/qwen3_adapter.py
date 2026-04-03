@@ -227,11 +227,8 @@ class Qwen3Adapter(ModelAdapter):
         Batched decode attention for one Qwen3 layer.
 
         Projects Q only (K/V already in cache), applies per-token RoPE,
-        then either:
-          - Triton path: calls kv_cache_mgr.decode_attention (fused paged
-            attention reading directly from the KV pools), or
-          - Fallback path: gathers packed KV with build_packed_kv, then runs
-            flash_attn_varlen_func / SDPA.
+        gathers packed KV with ``build_packed_kv``, then runs
+        ``flash_attn_varlen_func``.
 
         Returns:
             attn_output : (1, N, hidden_size)
@@ -239,7 +236,7 @@ class Qwen3Adapter(ModelAdapter):
         N = len(seq_ids)
         _, total_q, _ = hidden_states.size()
 
-        # --- Q projection + RoPE (unchanged) ---
+        # Treat each decode token as an independent (batch=N, seq=1) sequence.
         hs = hidden_states.squeeze(0).unsqueeze(1)  # (N, 1, D)
         q, _, _ = self.project_qkv(attn, hs)
         # q: (N, 1, num_heads, head_dim)
@@ -249,29 +246,24 @@ class Qwen3Adapter(ModelAdapter):
         ).unsqueeze(1)  # (N, 1)
         cos, sin = self._build_cos_sin(position_ids, q)
         q = self._apply_cos_sin(q, cos, sin)
-        q_flat = q.squeeze(1)  # (N, num_heads, head_dim)
+        # Squeeze seq dim → (N, num_heads, head_dim) as required by varlen flash
+        q_flat = q.squeeze(1)
 
-        # --- Attention: Triton fast path vs. gather fallback ---
-        if hasattr(kv_cache_mgr, 'decode_attention'):
-            # Triton PagedAttention — reads K/V directly from paged pools.
-            # No build_packed_kv gather, no index tensor construction.
-            o = kv_cache_mgr.decode_attention(q_flat, seq_ids, layer_idx)
-        else:
-            # Original path: gather KV into packed tensors + varlen attention.
-            packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
-                seq_ids, layer_idx,
-            )
-            cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
-            window = None if window_size is None else window_size
-            o = attn_decode(
-                q_flat, packed_k, packed_v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_k=max_seqlen_k,
-                N=N,
-                window_size=window,
-            )
+        packed_k, packed_v, cu_seqlens_k, max_seqlen_k = kv_cache_mgr.build_packed_kv(
+            seq_ids, layer_idx,
+        )
 
+        cu_seqlens_q = torch.arange(0, N + 1, device=q.device, dtype=torch.int32)
+
+        window = None if window_size is None else window_size
+        o = attn_decode(
+            q_flat, packed_k, packed_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_k=max_seqlen_k,
+            N=N,
+            window_size=window,
+        )
         # o: (N, num_heads, head_dim) → reshape and project
         o = o.unsqueeze(0).reshape(1, total_q, -1)
         return attn.o_proj(o)

@@ -41,9 +41,9 @@ class MentatGenerator:
         repetition_penalty: float = 1.2,
         # Paged cache config
         block_size: int = 16,
-        max_blocks: int = 12000,
+        max_blocks: int = 8192,
         # Semantic diversity pruning
-        semantic_similarity_threshold: float = 0.95,
+        semantic_similarity_threshold: float = 0.85,
         ema_alpha: float = 0.3,
         min_steps_before_prune: int = 5,
         # Soft exploration warmup
@@ -98,17 +98,6 @@ class MentatGenerator:
             device=device,
             dtype=dtype,
         )
-
-        # ---- Triton PagedAttention upgrade ----
-        # Wrap the base cache manager with GPU-native metadata + Triton
-        # decode kernel when available.  This eliminates the per-layer
-        # Python-loop gather in build_packed_kv during decode.
-        try:
-            from core.paged_attention_triton import TritonPagedCacheManager, HAS_TRITON
-            if HAS_TRITON and device.type == "cuda":
-                self.kv_cache_mgr = TritonPagedCacheManager(self.kv_cache_mgr)
-        except ImportError:
-            pass  # Triton not installed — use gather + flash_attn path
 
         # Create paged model wrapper
         self.wrapper = PagedModelWrapper(
@@ -208,15 +197,7 @@ class MentatGenerator:
             for leaf, leaf_logits in zip(list(active), logits_list):
                 if not leaf.is_active:
                     continue
-                
-                # Track state before stepping
-                was_active = leaf.is_active
-                
                 self._step_leaf(tree, leaf, leaf_logits, step, num_active)
-                
-                # If the leaf branched, it will have been deactivated
-                if was_active and not leaf.is_active:
-                    num_active += (self.K - 1)
 
             # -- Semantic diversity prune  --
             self._prune_similar(tree, step)
@@ -234,29 +215,31 @@ class MentatGenerator:
             self._peak_vram_bytes = torch.cuda.max_memory_allocated(self.wrapper.device)
 
         # ---- Collect results ----
+        # ---- Collect results ----
         results = []
-
+        
         # Combine both complete and active leaves for processing
         all_nodes = tree.get_complete_sequences() + tree.get_active_leaves()
-
+        
         for node in all_nodes:
             tids = node.get_full_sequence()
+            length = max(len(tids), 1) # Prevent division by zero
+            
+            # Calculate length-normalized probability
+            norm_prob = math.exp(node.cumulative_log_prob / length)
+            
             results.append({
                 'token_ids': tids,
                 'text': self.tokenizer.decode(tids, skip_special_tokens=True),
                 'log_prob': node.cumulative_log_prob,
+                'norm_prob': norm_prob, # Add the new metric
             })
 
         # Free any remaining paged sequences
         self._free_all_sequences(tree)
 
-        # Sort by raw cumulative log-prob so the model's most confident
-        # completion ranks first.  Length-normalised scores bias toward
-        # short / degenerate sequences and hurt acc@k.
-        results.sort(
-            key=lambda r: (r['log_prob'] / max(len(r['token_ids']), 1), len(r['token_ids'])), 
-            reverse=True
-        )
+        # Sort using the newly calculated normalized probability
+        results.sort(key=lambda r: r['norm_prob'], reverse=True)
 
         self.tree = tree
         return results
@@ -297,7 +280,7 @@ class MentatGenerator:
         step: int,
     ):
         """Branch *leaf* into top-K children via paged fork."""
-        log_probs = F.log_softmax(logits / self.temperature, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
         topk_vals, topk_ids = torch.topk(log_probs, self.K)
 
         token_ids = topk_ids.tolist()
@@ -322,7 +305,7 @@ class MentatGenerator:
         logits: torch.Tensor,
     ):
         """Greedy-extend *leaf* by one token."""
-        log_probs = F.log_softmax(logits / self.temperature, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
         best_id = torch.argmax(log_probs).item()
         best_lp = log_probs[best_id].item()
 
